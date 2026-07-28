@@ -1,7 +1,9 @@
 """OCR + media re-upload forwarding (defeats protected-chat forward restrictions).
 
-Extracted and cleaned from telbot.py/bota.py: download -> OCR-rename -> re-upload
-to targets. Keeps the multi-format OCR (image/pdf/video/document) you already wrote.
+Extracted/cleaned from telbot.py/bota.py: download -> OCR-rename -> re-upload.
+Primary OCR path uses **kreuzberg** (a precompiled Rust library with a Python
+API) for speed; falls back to the per-format Tesseract path if kreuzberg is
+unavailable. For 5000+ files, use `batch_extract_files` (Rust-parallel).
 """
 from __future__ import annotations
 
@@ -25,15 +27,66 @@ try:
 except Exception:  # pragma: no cover
     docx2txt = None
 
+# Kreuzberg: precompiled Rust, Python-callable. Fast OCR/text extraction.
+try:
+    from kreuzberg import extract_file_sync, batch_extract_files
+except Exception:  # pragma: no cover
+    extract_file_sync = None
+    batch_extract_files = None
+
 pytesseract.pytesseract.tesseract_cmd = os.environ.get("TESSERACT_CMD", "/usr/bin/tesseract")
+
+_KREUZBERG_OK = extract_file_sync is not None
 
 
 def _suggested_name(text: str, ext: str) -> str:
     return "_".join(text.split()[:5]).replace("/", "_") + ext
 
 
+def extract_text_kreuzberg(file_path: str) -> tuple[str | None, str | None]:
+    """Fast path: Rust-backed extraction via kreuzberg. Returns (text, suggested)."""
+    if not _KREUZBERG_OK:
+        return None, None
+    try:
+        result = extract_file_sync(file_path)
+        text = (result.text or "").strip()
+        if text:
+            return text, _suggested_name(text, Path(file_path).suffix)
+    except Exception:
+        return None, None
+    return None, None
+
+
+def batch_extract(file_paths: list[str]) -> dict[str, str]:
+    """Rust-parallel extraction for many files. Returns {path: text}."""
+    out: dict[str, str] = {}
+    if not batch_extract_files or not file_paths:
+        for p in file_paths:
+            t, _ = extract_text_kreuzberg(p)
+            if t:
+                out[p] = t
+        return out
+    try:
+        results = batch_extract_files(file_paths)
+        # API returns list of ExtractionResult or dict; normalize defensively.
+        items = results.items() if isinstance(results, dict) else zip(file_paths, results)
+        for path, res in items:
+            text = getattr(res, "text", res) if not isinstance(res, str) else res
+            if isinstance(text, str) and text.strip():
+                out[path] = text.strip()
+    except Exception:
+        for p in file_paths:
+            t, _ = extract_text_kreuzberg(p)
+            if t:
+                out[p] = t
+    return out
+
+
 def extract_text(file_path: str) -> tuple[str | None, str | None]:
-    """Run OCR/extraction by extension. Returns (text, suggested_filename)."""
+    """OCR/extraction by extension. Tries fast kreuzberg first, then Tesseract."""
+    fast, sugg = extract_text_kreuzberg(file_path)
+    if fast:
+        return fast, sugg
     ext = Path(file_path).suffix.lower()
     processors = {
         ".png": _process_image, ".jpg": _process_image, ".jpeg": _process_image,

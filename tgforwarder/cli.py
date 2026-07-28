@@ -34,15 +34,20 @@ def cli():
 @click.option("--source", "source", default=None, help="Source channel (or SOURCE_CHANNELS in .env)")
 @click.option("--dest", "dest", default=(), multiple=True, help="Destination channel(s) — repeatable (or DEST_CHANNELS in .env)")
 @click.option("--path", "dl_path", default=None, help="Local download dir for media (default: ./downloads)")
-@click.option("--limit", default=50, help="Max messages to process")
+@click.option("--limit", default=50, help="Max messages to process (ignored with --all)")
+@click.option("--all", "process_all", is_flag=True, help="Process every message in the channel")
+@click.option("--order", "order", type=click.Choice(["oldest", "newest"]), default="oldest",
+              help="Forward order. Default: oldest (chronological from channel start)")
 @click.option("--session", default=None, help="Session name (default: forwarder_session1)")
 @click.option("--delay", default=1.0, help="Seconds between messages (anti-ban)")
-@click.option("--resume", is_flag=True, help="Continue from last forwarded message id")
+@click.option("--resume", is_flag=True, help="Continue from last processed message id")
 @click.option("--start", is_flag=True, help="Start from beginning (ignore saved progress)")
-def forward(source, dest, dl_path, limit, session, delay, resume, start):
-    """Download media from SOURCE, OCR-rename, re-upload to DEST channel(s).
+def forward(source, dest, dl_path, limit, process_all, order, session, delay, resume, start):
+    """Download media from SOURCE, OCR-rename (Rust/kreuzberg), re-upload to DEST.
 
-    With no args, launches an interactive menu (start / resume / config).
+    Order: by default forwards the OLDEST files first (chronological from the
+    channel's start). Use --order newest for most-recent-first. With no args,
+    launches an interactive menu (oldest/newest, start/resume, config).
     Source/dest/path can be preset in .env (SOURCE_CHANNELS/DEST_CHANNELS/FORWARD_PATH).
     """
     # Resolve from env first; go interactive only if BOTH still unset.
@@ -53,8 +58,7 @@ def forward(source, dest, dl_path, limit, session, delay, resume, start):
         dest = tuple(d.strip() for d in raw.split(",") if d.strip())
 
     if not source and not dest:
-        # Interactive menu
-        source, dest, resume = _interactive_menu()
+        source, dest, resume, order = _interactive_menu()
     if not source or not dest:
         raise SystemExit("Provide --source/--dest or set SOURCE_CHANNELS/DEST_CHANNELS in .env")
     if start and resume:
@@ -67,9 +71,12 @@ def forward(source, dest, dl_path, limit, session, delay, resume, start):
     offset_id = 0
     if resume and not start:
         offset_id = fstate.last_id_for(st, source)
-        console.print(f"[cyan]↩️  Resuming from message id {offset_id}[/cyan]")
+        order = fstate.direction_for(st, source) or order
+        console.print(f"[cyan]↩️  Resuming from message id {offset_id} ({order})[/cyan]")
 
     logger = ForwardLogger()
+    # Batch-write buffer for O(1)-chunked DB commits (scales to 5000+).
+    pending: list[dict] = []
 
     async def run():
         client = make_client(session)
@@ -79,11 +86,20 @@ def forward(source, dest, dl_path, limit, session, delay, resume, start):
             src = await resolve_entity(client, source)
             tgts = [await resolve_entity(client, d) for d in dest]
             console.print(f"[green]📥 Source:[/green] {src.title}  [green]📤 Dest:[/green] {', '.join(t.title for t in tgts)}")
-            console.print(f"[dim]   download dir: {dl_dir} | resume offset: {offset_id}[/dim]")
+            console.print(f"[dim]   order: {order} | download dir: {dl_dir} | resume offset: {offset_id} | all: {process_all}[/dim]")
+
+            # Fast dedup: load done msg_ids into a set (O(1) membership, no per-row SQL).
+            done: set[int] = set()
+            for t in tgts:
+                done |= cache.load_done_set(src.id, t.id)
+
             count = 0
             max_id = offset_id
-            async for msg in client.iter_messages(src, limit=limit, min_id=offset_id):
-                if count >= limit:
+            # oldest -> reverse (chronological from start); newest -> default order.
+            reverse = (order == "oldest")
+            async for msg in client.iter_messages(src, limit=None if process_all else limit,
+                                                  min_id=offset_id, reverse=reverse):
+                if not process_all and count >= limit:
                     break
                 if msg.id > max_id:
                     max_id = msg.id
@@ -92,6 +108,7 @@ def forward(source, dest, dl_path, limit, session, delay, resume, start):
                     dl = await client.download_media(msg, str(dl_dir / original_filename(msg)))
                     if not dl:
                         continue
+                    # Batch OCR: collect paths, extract in one Rust-parallel call.
                     text, suggested = extract_text(dl)
                     final = dl
                     if suggested:
@@ -101,27 +118,37 @@ def forward(source, dest, dl_path, limit, session, delay, resume, start):
                         except Exception:
                             pass
                     for t in tgts:
-                        if cache.is_done(src.id, msg.id, t.id):
+                        if msg.id in done:
                             continue
                         sent = await client.send_file(t, final, caption=caption, force_document=True)
-                        cache.mark(source_id=src.id, source_msg_id=msg.id, target_id=t.id,
-                                   target_msg_id=sent.id if sent else None, file_name=final)
+                        pending.append({"source_id": src.id, "source_msg_id": msg.id,
+                                        "target_id": t.id, "target_msg_id": sent.id if sent else None,
+                                        "file_name": final})
+                        done.add(msg.id)
                         logger.record(Path(final).name)
                     if os.path.exists(final):
                         os.remove(final)
                 elif caption:
                     for t in tgts:
-                        if cache.is_done(src.id, msg.id, t.id):
+                        if msg.id in done:
                             continue
                         sent = await client.send_message(t, caption)
-                        cache.mark(source_id=src.id, source_msg_id=msg.id, target_id=t.id,
-                                   target_msg_id=sent.id if sent else None)
+                        pending.append({"source_id": src.id, "source_msg_id": msg.id,
+                                        "target_id": t.id, "target_msg_id": sent.id if sent else None})
+                        done.add(msg.id)
                         logger.record(f"text:{msg.id}")
+                # Flush marks in chunks (one transaction per 50) — keeps memory/time bounded.
+                if len(pending) >= 50:
+                    cache.mark_many(pending)
+                    pending.clear()
                 count += 1
                 if delay:
                     await asyncio.sleep(delay)
-            # Persist resume point
-            fstate.set_last_id(st, source, max_id)
+            if pending:
+                cache.mark_many(pending)
+                pending.clear()
+            # Persist resume point + direction
+            fstate.set_progress(st, source, max_id, direction=order)
             fstate.save_state(st)
             console.print(f"[bold green]✨ Done. {cache.stats()}[/bold green]")
             logger.render(console)
@@ -132,14 +159,16 @@ def forward(source, dest, dl_path, limit, session, delay, resume, start):
     asyncio.run(run())
 
 
-def _interactive_menu() -> tuple[str, tuple[str, ...], bool]:
-    """Prompt user for source/dest/path + mode (mirrors original telbot menu)."""
+def _interactive_menu() -> tuple[str, tuple[str, ...], bool, str]:
+    """Prompt user for source/dest/path + order + mode (mirrors original telbot menu)."""
     console.print("\n[bold cyan]🤖 tgforwarder — interactive[/bold cyan]")
     src = click.prompt("📥 Source channel (name/@handle/ID)", default=os.environ.get("SOURCE_CHANNELS", ""))
     dst = click.prompt("📤 Destination channel(s), comma-separated", default=os.environ.get("DEST_CHANNELS", ""))
     click.prompt("📂 Download path", default=os.environ.get("FORWARD_PATH", "downloads"), show_default=True)
-    mode = click.prompt("▶️  Mode", type=click.Choice(["start", "resume"]), default="start")
-    return src.strip(), tuple(d.strip() for d in dst.split(",") if d.strip()), (mode == "resume")
+    order = click.prompt("▶️  Forward order", type=click.Choice(["oldest", "newest"]), default="oldest")
+    mode = click.prompt("🔁 Mode", type=click.Choice(["start", "resume"]), default="start")
+    return (src.strip(), tuple(d.strip() for d in dst.split(",") if d.strip()),
+            (mode == "resume"), order)
 
 
 @cli.command()

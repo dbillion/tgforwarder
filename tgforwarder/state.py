@@ -1,7 +1,7 @@
 """Resume-state persistence for the forwarder (offline-testable).
 
-Stores the last forwarded message id per source channel so `--resume`
-continues from where a previous run stopped, and `--start` ignores it.
+Stores the last processed message id AND direction (oldest/newest) per source
+so `--resume` continues correctly regardless of forward order.
 """
 from __future__ import annotations
 
@@ -27,11 +27,20 @@ def save_state(state: dict, path: Path | None = None) -> None:
     p.write_text(json.dumps(state, indent=2))
 
 
+def _entry(state: dict, source: str) -> dict:
+    return state.setdefault("sources", {}).setdefault(str(source), {})
+
+
 def last_id_for(state: dict, source: str) -> int:
-    return int(state.get("sources", {}).get(str(source), {}).get("last_message_id", 0))
+    return int(_entry(state, source).get("last_message_id", 0))
 
 
-def set_last_id(state: dict, source: str, msg_id: int) -> dict:
-    state.setdefault("sources", {})
-    state["sources"][str(source)] = {"last_message_id": msg_id}
+def direction_for(state: dict, source: str) -> str:
+    return _entry(state, source).get("direction", "oldest")
+
+
+def set_progress(state: dict, source: str, msg_id: int, direction: str = "oldest") -> dict:
+    e = _entry(state, source)
+    e["last_message_id"] = msg_id
+    e["direction"] = direction
     return state

@@ -42,6 +42,37 @@ class ForwardCache:
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
 
+    def load_done_set(self, source_id: int, target_id: int) -> set[int]:
+        """Bulk-load already-forwarded source_msg_ids into an in-memory set (O(1) lookups).
+
+        For 5000+ files this avoids a per-message SQL round-trip.
+        """
+        rows = self.conn.execute(
+            "SELECT source_msg_id FROM forwarded WHERE source_id=? AND target_id=?",
+            (source_id, target_id),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def mark_many(self, rows: list[dict]) -> None:
+        """Batched insert via executemany (one transaction). O(n) total, not O(n) commits."""
+        if not rows:
+            return
+        data = [
+            (
+                r["source_id"], r["source_msg_id"], r["target_id"],
+                r.get("target_msg_id"), r.get("file_name"),
+                datetime.now(timezone.utc).isoformat(), r.get("status", "ok"),
+            )
+            for r in rows
+        ]
+        self.conn.executemany(
+            """INSERT OR REPLACE INTO forwarded
+               (source_id, source_msg_id, target_id, target_msg_id, file_name, timestamp, status)
+               VALUES (?,?,?,?,?,?,?)""",
+            data,
+        )
+        self.conn.commit()
+
     def is_done(self, source_id: int, source_msg_id: int, target_id: int) -> bool:
         row = self.conn.execute(
             "SELECT 1 FROM forwarded WHERE source_id=? AND source_msg_id=? AND target_id=?",

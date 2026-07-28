@@ -139,6 +139,21 @@ def test_cache_no_duplicate_on_repeat(tmp_path):
     c.close()
 
 
+def test_cache_bulk_load_and_mark_many(tmp_path):
+    db = tmp_path / "fwd3.db"
+    c = ForwardCache(db)
+    # Simulate 5000 prior forwards in one batch write.
+    rows = [{"source_id": 10, "source_msg_id": i, "target_id": 20} for i in range(1, 5001)]
+    c.mark_many(rows)
+    c.close()
+    c2 = ForwardCache(db)
+    done = c2.load_done_set(10, 20)
+    assert len(done) == 5000
+    assert 1 in done and 5000 in done
+    assert c2.is_done(10, 2500, 20) is True
+    c2.close()
+
+
 # --------------------------------------------------------------------------
 # state (resume persistence)
 # --------------------------------------------------------------------------
@@ -147,14 +162,15 @@ def test_state_roundtrip(tmp_path):
     p = tmp_path / "st.json"
     st = state.load_state(p)
     assert state.last_id_for(st, "src1") == 0
-    state.set_last_id(st, "src1", 555)
+    state.set_progress(st, "src1", 555, direction="oldest")
     state.save_state(st, p)
     st2 = state.load_state(p)
     assert state.last_id_for(st2, "src1") == 555
+    assert state.direction_for(st2, "src1") == "oldest"
 
 
 # --------------------------------------------------------------------------
-# report.ForwardLogger
+# report.ForwardLogger (scales to 5000+ via deque + Counter)
 # --------------------------------------------------------------------------
 def test_logger_counts_and_types():
     from tgforwarder.report import ForwardLogger
@@ -179,4 +195,16 @@ def test_logger_recent_window_filters_old():
     l.record("new.png", now)
     recent = l.recent_window(minutes=5)
     assert len(recent) == 1
-    assert recent[0]["name"] == "new.png"
+    assert recent[0] == "new.png"
+
+
+def test_logger_caps_names_memory():
+    from tgforwarder.report import ForwardLogger
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    l = ForwardLogger()
+    for i in range(1000):
+        l.record(f"f{i}.png", now)
+    # total keeps counting; stored names capped at MAX_NAMES (50)
+    assert l.count() == 1000
+    assert len(l._names) == 50

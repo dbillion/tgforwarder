@@ -3,10 +3,13 @@
 Tracks per-forwarded file: name, type, timestamp. Renders a summary with
 emoji + color via rich: total count, breakdown by type, file names, and a
 rolling 5-minute window of recent forwards.
+
+Scales to 5000+ files: uses a bounded deque (recent names, O(1) append) and a
+Counter (type tally, O(1) increment) — no unbounded list growth.
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -14,6 +17,7 @@ from rich.console import Console
 from rich.table import Table
 
 WINDOW_MINUTES = 5
+MAX_NAMES = 50  # cap stored names to keep memory O(1) at 5000+ scale
 
 
 def _ext(name: str) -> str:
@@ -22,25 +26,35 @@ def _ext(name: str) -> str:
 
 class ForwardLogger:
     def __init__(self) -> None:
-        self.records: list[dict] = []  # {name, type, ts:datetime}
+        # deque caps stored names at MAX_NAMES; Counter tallies types in O(1).
+        self._names: deque[str] = deque(maxlen=MAX_NAMES)
+        self._window: deque[tuple[datetime, str]] = deque()  # (ts, name) for 5m window
+        self._types: Counter[str] = Counter()
+        self._total = 0
 
     def record(self, name: str, ts: datetime | None = None) -> None:
         ts = ts or datetime.now(timezone.utc)
-        self.records.append({"name": name, "type": _ext(name), "ts": ts})
+        self._total += 1
+        self._names.append(name)
+        self._types[_ext(name)] += 1
+        self._window.append((ts, name))
 
     def count(self) -> int:
-        return len(self.records)
+        return self._total
 
     def by_type(self) -> dict:
-        return dict(Counter(r["type"] for r in self.records))
+        return dict(self._types)
 
-    def recent_window(self, minutes: int = WINDOW_MINUTES) -> list[dict]:
+    def recent_window(self, minutes: int = WINDOW_MINUTES) -> list[str]:
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
-        return [r for r in self.records if r["ts"] >= cutoff]
+        # prune old entries (amortized O(1)); then return names in window
+        while self._window and self._window[0][0] < cutoff:
+            self._window.popleft()
+        return [n for _, n in self._window]
 
     def render(self, console: Console | None = None) -> None:
         console = console or Console()
-        if not self.records:
+        if self._total == 0:
             console.print("[yellow]⚠️  No files forwarded.[/yellow]")
             return
 
@@ -67,7 +81,8 @@ class ForwardLogger:
         console.print(t)
 
         console.print("[bold yellow]📝 Forwarded file names:[/bold yellow]")
-        for r in self.records[-15:]:
-            console.print(f"  • [white]{r['name']}[/white] [dim]({r['type']})[/dim]")
-        if total > 15:
-            console.print(f"  [dim]… and {total - 15} more[/dim]")
+        shown = min(len(self._names), 15)
+        for name in list(self._names)[-shown:]:
+            console.print(f"  • [white]{name}[/white] [dim]({_ext(name)})[/dim]")
+        if total > shown:
+            console.print(f"  [dim]… and {total - shown} more[/dim]")
