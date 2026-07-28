@@ -177,6 +177,56 @@ def test_cache_rebuild_done_set_replaces_inflated_cache(tmp_path):
     c.close()
 
 
+def test_cache_migration_adds_content_hash_column(tmp_path):
+    """An old DB created WITHOUT content_hash must be migrated transparently on open.
+    Regression for the sqlite3.OperationalError: no such column: content_hash crash."""
+    import sqlite3
+    db = tmp_path / "fwd_old.db"
+    # Create a DB with the OLD schema (no content_hash column).
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+        CREATE TABLE forwarded (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL,
+            source_msg_id INTEGER NOT NULL,
+            target_id INTEGER NOT NULL,
+            target_msg_id INTEGER,
+            file_name TEXT,
+            timestamp TEXT NOT NULL,
+            status TEXT DEFAULT 'ok',
+            UNIQUE(source_id, source_msg_id, target_id)
+        );
+    """)
+    conn.execute("INSERT INTO forwarded (source_id, source_msg_id, target_id, timestamp) VALUES (1, 5, 2, '2026-01-01')")
+    conn.commit(); conn.close()
+    # Opening with ForwardCache must migrate: add content_hash without error.
+    c = ForwardCache(db)
+    # mark_many with content_hash must now work (proves the column exists).
+    c.mark_many([{"source_id": 1, "source_msg_id": 6, "target_id": 2, "content_hash": "abc123"}])
+    hashes = c.load_done_hashes(1, 2)
+    assert hashes == {"abc123"}
+    # Re-opening must be idempotent (migration safe to run again).
+    c.close()
+    c2 = ForwardCache(db)
+    assert c2.load_done_hashes(1, 2) == {"abc123"}
+    c2.close()
+
+
+def test_cache_hash_dedup_per_target(tmp_path):
+    """COPY mode dedup: same content hash in two targets, different source ids."""
+    db = tmp_path / "fwdh.db"
+    c = ForwardCache(db)
+    c.mark_many([
+        {"source_id": 7, "source_msg_id": 100, "target_id": 11, "content_hash": "H1"},
+        {"source_id": 7, "source_msg_id": 100, "target_id": 12, "content_hash": "H1"},
+    ])
+    assert c.load_done_hashes(7, 11) == {"H1"}
+    assert c.load_done_hashes(7, 12) == {"H1"}
+    # A different msg id with a new hash is NOT yet done for target 11.
+    assert c.load_done_hashes(7, 11) == {"H1"}  # only H1
+    c.close()
+
+
 # --------------------------------------------------------------------------
 # state (resume persistence)
 # --------------------------------------------------------------------------

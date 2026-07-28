@@ -26,12 +26,24 @@ CREATE TABLE IF NOT EXISTS forwarded (
     target_id     INTEGER NOT NULL,
     target_msg_id INTEGER,
     file_name     TEXT,
+    content_hash  TEXT,
     timestamp     TEXT NOT NULL,
     status        TEXT DEFAULT 'ok',
     UNIQUE(source_id, source_msg_id, target_id)
 );
 CREATE INDEX IF NOT EXISTS idx_forwarded_src ON forwarded(source_id, source_msg_id);
 """
+
+
+# Idempotent migrations for DBs created by older schema versions.
+# NOTE: content_hash column + its index live here (NOT in _SCHEMA) so that an old DB
+# without the column can open: executescript(_SCHEMA) would fail on an index referencing
+# a missing column otherwise. Migration adds the column, then the index.
+_MIGRATIONS = [
+    "ALTER TABLE forwarded ADD COLUMN content_hash TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_forwarded_hash ON forwarded(source_id, content_hash, target_id)",
+]
+
 
 
 class ForwardCache:
@@ -41,6 +53,15 @@ class ForwardCache:
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(_SCHEMA)
+        # Apply idempotent migrations for older DBs (catch "duplicate column" errors).
+        for mig in _MIGRATIONS:
+            try:
+                self.conn.execute(mig)
+                self.conn.commit()
+            except sqlite3.OperationalError as e:
+                if "duplicate column" in str(e) or "already exists" in str(e):
+                    continue
+                raise
 
     def load_done_set(self, source_id: int, target_id: int) -> set[int]:
         """Bulk-load already-forwarded source_msg_ids into an in-memory set (O(1) lookups).
@@ -53,6 +74,15 @@ class ForwardCache:
         ).fetchall()
         return {r[0] for r in rows}
 
+    def load_done_hashes(self, source_id: int, target_id: int) -> set[str]:
+        """For COPY mode (protected chats, no saved_from_peer): dedup by content hash."""
+        rows = self.conn.execute(
+            "SELECT content_hash FROM forwarded WHERE source_id=? AND target_id=? "
+            "AND content_hash IS NOT NULL",
+            (source_id, target_id),
+        ).fetchall()
+        return {r[0] for r in rows}
+
     def mark_many(self, rows: list[dict]) -> None:
         """Batched insert via executemany (one transaction). O(n) total, not O(n) commits."""
         if not rows:
@@ -61,14 +91,15 @@ class ForwardCache:
             (
                 r["source_id"], r["source_msg_id"], r["target_id"],
                 r.get("target_msg_id"), r.get("file_name"),
+                r.get("content_hash"),
                 datetime.now(timezone.utc).isoformat(), r.get("status", "ok"),
             )
             for r in rows
         ]
         self.conn.executemany(
             """INSERT OR REPLACE INTO forwarded
-               (source_id, source_msg_id, target_id, target_msg_id, file_name, timestamp, status)
-               VALUES (?,?,?,?,?,?,?)""",
+               (source_id, source_msg_id, target_id, target_msg_id, file_name, content_hash, timestamp, status)
+               VALUES (?,?,?,?,?,?,?,?)""",
             data,
         )
         self.conn.commit()

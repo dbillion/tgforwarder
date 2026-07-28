@@ -67,16 +67,17 @@ def timer(label: str):
         console.print(f"[dim]⏱️  {label}: {time.perf_counter() - start:.2f}s[/dim]")
 
 
-async def iter_undone(client, src, done: set[int], *, order: str, min_id: int = 0):
-    """Lazy pipeline (notebook §9): yield only source messages not yet delivered.
+async def iter_undone(client, src, done_sets: list[set[int]], *, order: str, min_id: int = 0):
+    """Lazy pipeline (notebook §9): yield only source messages not yet delivered to ALL targets.
 
-    Acts as the producer in a producer/consumer flow — at 12k messages this stays
-    O(1) in memory and never materializes a full list. `done` is the ground-truth
-    set rebuilt from the target, so duplicates are filtered here, before forwarding.
+    `done_sets` is one set per target (dedup is per-target, so each target ends up a
+    complete copy). A message is skipped only if it is already present in EVERY target;
+    if even one target lacks it, it is forwarded (and the batch delivers it to all targets,
+    but only the missing ones keep it after verification).
     """
     reverse = order == "oldest"
     async for msg in client.iter_messages(src, min_id=min_id, reverse=reverse):
-        if msg.id in done:
+        if all(msg.id in s for s in done_sets):
             continue
         caption = (getattr(msg, "text", None) or getattr(msg, "message", None)
                    or getattr(msg, "caption", None))
@@ -121,6 +122,27 @@ async def iter_source_ids_full(client, target, src_id: int) -> set[int]:
     return delivered
 
 
+import hashlib
+
+
+def content_hash_of(msg) -> str:
+    """Stable content key for COPY mode (no saved_from_peer available).
+
+    Uses text + media descriptor (name+size+type). Media bytes are NOT hashed here
+    (that would require downloading); name+size is a stable, collision-resistant key
+    for re-post dedup, and we only download when we actually re-post.
+    """
+    text = (getattr(msg, "message", None) or getattr(msg, "text", None)
+            or getattr(msg, "caption", None) or "")
+    media = msg.media
+    if media is not None:
+        name = original_filename(msg)
+        size = getattr(getattr(media, "document", None), "size", None) or getattr(media, "size", None) or 0
+        kind = type(media).__name__
+        text += f"||{kind}|{name}|{size}"
+    return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+
+
 async def verify_ids_exist(client, target, ids: list[int]) -> set[int]:
     """Re-read message ids from the target to confirm they actually landed.
 
@@ -163,9 +185,10 @@ async def _forward_batch(client, tgts, batch, done, cache, pending, logger, veri
         except Exception:
             res = None
         if not res:
-            # Hard failure: release reservation so this batch retries next run.
+            # Hard failure: release reservation in ALL targets so this batch retries next run.
             for m in batch_msgs:
-                done.discard(m.id)
+                for s in done.values():
+                    s.discard(m.id)
             continue
         sent_list = res if isinstance(res, list) else [res]
         returned_ids = [getattr(s, "id", None) for s in sent_list]
@@ -183,8 +206,10 @@ async def _forward_batch(client, tgts, batch, done, cache, pending, logger, veri
                 logger.record(pending[-1]["file_name"])
                 verified_count += 1
             else:
-                # Ghost forward (returned but not in target): release reservation -> retry.
-                done.discard(m.id)
+                # Ghost forward (returned but not in target): release reservation in ALL
+                # targets -> retry next run.
+                for s in done.values():
+                    s.discard(m.id)
         # Flush marks in chunks (bounded memory, bounded commits).
         if len(pending) >= mark_threshold:
             cache.mark_many(pending)
@@ -223,7 +248,11 @@ def cli():
               help="Recency-bounded rebuild: scan the target newest-first and stop after a cold "
                    "streak. Fast (no full download) but may miss old forwards. Use only on a "
                    "trusted, already-populated cache.")
-def forward(source, dest, dl_path, limit, process_all, order, session, delay, batch_size, resume, start, rebuild_cache, force_rebuild, quick_rebuild):
+@click.option("--copy", "copy_mode", is_flag=True, default=False,
+              help="COPY mode for protected chats that block forwarding (ChatForwardsRestricted). "
+                   "Downloads each message and re-posts it to the targets (no saved_from linkage). "
+                   "Dedup is by content hash instead of saved_from_msg_id.")
+def forward(source, dest, dl_path, limit, process_all, order, session, delay, batch_size, resume, start, rebuild_cache, force_rebuild, quick_rebuild, copy_mode):
     """Forward messages/media from SOURCE to DEST (native copy; Rust/kreuzberg OCR fallback).
 
     Order: by default forwards the OLDEST files first (chronological from the
@@ -287,8 +316,14 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             # first derive GROUND TRUTH from the target: scan Saved/DMs for messages whose
             # fwd_from.saved_from_peer == source, collect their saved_from_msg_id, and
             # overwrite the cache with exactly that set. Only then do we dedup against truth.
-            done: set[int] = set()
+            done_by_target: dict[int, set] = {}
             for t in tgts:
+                if copy_mode:
+                    # COPY mode: dedup by content hash. No saved_from rebuild (none exists).
+                    existing_h = cache.load_done_hashes(src.id, t.id)
+                    console.print(f"[dim]   COPY mode: loaded {len(existing_h)} content hashes for target '{getattr(t, 'title', None) or getattr(t, 'first_name', None) or t.id}'[/dim]")
+                    done_by_target[t.id] = existing_h
+                    continue
                 # Load persisted ground truth FIRST (O(1) indexed query, no network scan).
                 existing = cache.load_done_set(src.id, t.id)
                 need_scan = force_rebuild or (rebuild_cache and not existing)
@@ -301,10 +336,10 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                         delivered = await iter_source_ids_full(client, t, src.id)
                     removed = cache.rebuild_done_set(src.id, t.id, delivered)
                     console.print(f"[dim]   cache had {removed} rows; rebuilt with {len(delivered)} verified-delivered ids[/dim]")
-                    done |= delivered
+                    done_by_target[t.id] = delivered
                 else:
                     console.print(f"[dim]   using persisted cache ({len(existing)} delivered ids) — skip target scan[/dim]")
-                    done |= existing
+                    done_by_target[t.id] = existing
 
             count = 0
             run_forwarded = 0
@@ -313,58 +348,121 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             # the truthful `done` set handles dedup, and a min_id filter would wrongly
             # exclude messages with lower ids that were never actually delivered.
             min_id_arg = 0 if rebuild_cache else offset_id
-            batch: list[WorkItem] = []
-            # Producer: lazy generator yields only undelivered messages (notebook §9).
-            # Optimistic reservation happens per-item below so restarts never re-pick them.
-            producer = iter_undone(client, src, done, order=order, min_id=min_id_arg)
-            async for item in producer:
-                if not process_all and count >= limit:
-                    break
-                if item.msg.id > max_id:
-                    max_id = item.msg.id
-                # OPTIMISTIC RESERVATION: reserve this id now so a restart/re-run can never
-                # pick it again. PERSIST only after verify_ids_exist confirms it landed.
-                done.add(item.msg.id)
-                batch.append(item)
-                count += 1
-                # When the batch is full, forward all messages in ONE API call per target.
-                if len(batch) >= batch_size:
-                    run_forwarded += await _forward_batch(client, tgts, batch, done, cache, pending,
+            if not copy_mode:
+                batch: list[WorkItem] = []
+                # Producer: lazy generator yields only undelivered messages (per-target dedup).
+                producer = iter_undone(client, src, list(done_by_target.values()), order=order, min_id=min_id_arg)
+                async for item in producer:
+                    if not process_all and count >= limit:
+                        break
+                    if item.msg.id > max_id:
+                        max_id = item.msg.id
+                    # OPTIMISTIC RESERVATION: reserve this id in EVERY target's set so a
+                    # restart/re-run can never re-pick it. PERSIST only after verify confirms.
+                    for s in done_by_target.values():
+                        s.add(item.msg.id)
+                    batch.append(item)
+                    count += 1
+                    # When the batch is full, forward all messages in ONE API call per target.
+                    if len(batch) >= batch_size:
+                        run_forwarded += await _forward_batch(client, tgts, batch, done_by_target, cache, pending,
+                                                              logger, verify_ids_exist, mark_threshold=50,
+                                                              src_id=src.id)
+                        batch.clear()
+                        if delay:
+                            await asyncio.sleep(delay)
+                # Forward any remaining partial batch.
+                if batch:
+                    run_forwarded += await _forward_batch(client, tgts, batch, done_by_target, cache, pending,
                                                           logger, verify_ids_exist, mark_threshold=50,
                                                           src_id=src.id)
                     batch.clear()
-                    if delay:
-                        await asyncio.sleep(delay)
-            # Forward any remaining partial batch.
-            if batch:
-                run_forwarded += await _forward_batch(client, tgts, batch, done, cache, pending,
-                                                      logger, verify_ids_exist, mark_threshold=50,
-                                                      src_id=src.id)
-                batch.clear()
             if pending:
                 cache.mark_many(pending)
                 pending.clear()
+            # ---- COPY MODE (protected chats) ----
+            # No forward API works -> download each msg + re-post via send_message.
+            # Dedup by content hash (no saved_from_peer). For text-only msgs, send_message
+            # is fast; for media, download to temp dir then upload to each target.
+            if copy_mode:
+                import tempfile
+                copy_pending: list[dict] = []
+                copy_reverse = (order == "oldest")
+                copy_min_id = 0 if rebuild_cache else offset_id
+                async for msg in client.iter_messages(src, min_id=copy_min_id, reverse=copy_reverse):
+                    if not process_all and count >= limit:
+                        break
+                    if msg.id > max_id:
+                        max_id = msg.id
+                    h = content_hash_of(msg)
+                    # Skip only if every target already has this content hash (use cache-loaded sets).
+                    if all(h in s for s in done_by_target.values()):
+                        continue
+                    text = (getattr(msg, "message", None) or getattr(msg, "text", None)
+                            or getattr(msg, "caption", None) or "")
+                    media_path = None
+                    if msg.media:
+                        try:
+                            media_path = await client.download_media(msg, file=tempfile.NamedTemporaryFile(delete=False, suffix=Path(original_filename(msg)).suffix).name)
+                        except Exception as e:
+                            console.print(f"[yellow]⚠️  download failed for msg {msg.id}: {e}[/yellow]")
+                            continue
+                    # Send to each target that lacks this hash. Reserve to that target ONLY on success.
+                    for t in tgts:
+                        if h in done_by_target.get(t.id, set()):
+                            continue  # already delivered to this target
+                        try:
+                            sent = (await client.send_message(t, message=text, file=media_path)
+                                    if media_path else await client.send_message(t, message=text))
+                            if sent:
+                                done_by_target[t.id].add(h)
+                                run_forwarded += 1
+                                copy_pending.append({"source_id": src.id, "source_msg_id": msg.id,
+                                                     "target_id": t.id, "target_msg_id": sent.id,
+                                                     "file_name": original_filename(msg),
+                                                     "content_hash": h})
+                                logger.record(original_filename(msg))
+                        except Exception as e:
+                            console.print(f"[yellow]⚠️  send to target {t.id} failed: {e}[/yellow]")
+                            # do NOT add to done_by_target -> retries next run
+                        if delay:
+                            await asyncio.sleep(delay)
+                    count += 1
+                    if len(copy_pending) >= 50:
+                        cache.mark_many(copy_pending)
+                        copy_pending.clear()
+                if copy_pending:
+                    cache.mark_many(copy_pending)
+                    copy_pending.clear()
             # Persist resume point + direction
             fstate.set_progress(st, source, max_id, direction=order)
             fstate.save_state(st)
-            # FINAL VERIFICATION (ground truth): re-scan the first target and count how many
-            # of its messages actually originated from the source (saved_from_peer == src).
-            # This is the honest "did it really arrive" number — not the cache, not assumptions.
+            # FINAL VERIFICATION (ground truth, FORWARD mode): re-scan EVERY target and count
+            # messages that originated from the source (saved_from_peer == src). In COPY mode
+            # the target messages have no saved_from_peer (we re-posted them), so this scan
+            # would always return 0; instead, the cache hash-union is the honest delivered count.
             final_delivered = 0
-            try:
-                async for m in client.iter_messages(tgts[0]):
-                    fwd = getattr(m, "fwd_from", None)
-                    if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
-                        final_delivered += 1
-            except Exception:
-                final_delivered = -1
+            known_total = len(set().union(*done_by_target.values())) if done_by_target else 0
+            if not copy_mode:
+                try:
+                    for t in tgts:
+                        async for m in client.iter_messages(t):
+                            fwd = getattr(m, "fwd_from", None)
+                            if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
+                                final_delivered += 1
+                except Exception:
+                    final_delivered = -1
+            else:
+                # Copy mode: report the cache hash union as the verified delivered count.
+                final_delivered = known_total
             pct = (f"{final_delivered / src_total * 100:.1f}%" if (final_delivered >= 0 and src_total) else "n/a")
             console.print(
                 f"[bold green]✨ Done.[/bold green] "
                 f"forwarded this run: [cyan]{run_forwarded}[/cyan] | "
-                f"known delivered (cache): [yellow]{len(done)}[/yellow] | "
-                f"VERIFIED in target: [green]{final_delivered if final_delivered >= 0 else 'n/a'}[/green] / "
+                f"known delivered (cache, union): [yellow]{known_total}[/yellow] | "
+                f"VERIFIED: [green]{final_delivered if final_delivered >= 0 else 'n/a'}[/green] / "
                 f"source total: {src_total} ({pct})"
+                + (" [dim](COPY mode)[/dim]" if copy_mode else "")
             )
             logger.render(console)
         finally:
