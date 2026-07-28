@@ -98,6 +98,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                 done |= cache.load_done_set(src.id, t.id)
 
             count = 0
+            run_forwarded = 0
             max_id = offset_id
             # oldest -> reverse (chronological from start); newest -> default order.
             reverse = (order == "oldest")
@@ -129,7 +130,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                                                 "target_id": t.id, "target_msg_id": getattr(sent, "id", None),
                                                 "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
                                                              or (m.media and original_filename(m)) or f"msg:{m.id}"})
-                                done.add(m.id)
+                                done.add(m.id); run_forwarded += 1
                                 logger.record(pending[-1]["file_name"])
                     batch.clear()
                     # Flush marks in chunks (keeps memory/time bounded).
@@ -152,7 +153,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                                             "target_id": t.id, "target_msg_id": getattr(sent, "id", None),
                                             "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
                                                          or (m.media and original_filename(m)) or f"msg:{m.id}"})
-                            done.add(m.id)
+                            done.add(m.id); run_forwarded += 1
                             logger.record(pending[-1]["file_name"])
                 batch.clear()
             if pending:
@@ -161,7 +162,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             # Persist resume point + direction
             fstate.set_progress(st, source, max_id, direction=order)
             fstate.save_state(st)
-            console.print(f"[bold green]✨ Done. {cache.stats()}[/bold green]")
+            console.print(f"[bold green]✨ Done. forwarded this run: {run_forwarded} | cache total: {cache.stats()['forwarded']}[/bold green]")
             logger.render(console)
         finally:
             await client.disconnect()
