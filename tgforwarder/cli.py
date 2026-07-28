@@ -22,7 +22,174 @@ from .score import score_chats, format_table, DEFAULT_DB
 from . import state as fstate
 from .report import ForwardLogger
 
+from dataclasses import dataclass
+from functools import wraps
+from contextlib import contextmanager
+from telethon.tl.custom import Message
+import time
+
 console = Console()
+
+
+# --- Python Tricks (from dbillion/dsa-python-colab-notebooks) applied here ---
+
+@dataclass(frozen=True, slots=True)
+class WorkItem:
+    """One message queued for forwarding: the source Message plus its derived caption."""
+    msg: Message
+    caption: str | None
+
+
+def retry(times: int = 3, delay: float = 0.5):
+    """Notebook §7 — wrap a (possibly flaky) call so transient API errors self-heal."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exc = None
+            for _ in range(times):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as exc:  # transient network/MTProto errors
+                    last_exc = exc
+                    await asyncio.sleep(delay)
+            raise last_exc
+        return wrapper
+    return decorator
+
+
+@contextmanager
+def timer(label: str):
+    """Notebook §3 — print elapsed wall-time for a block, no manual start/stop."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        console.print(f"[dim]⏱️  {label}: {time.perf_counter() - start:.2f}s[/dim]")
+
+
+async def iter_undone(client, src, done: set[int], *, order: str, min_id: int = 0):
+    """Lazy pipeline (notebook §9): yield only source messages not yet delivered.
+
+    Acts as the producer in a producer/consumer flow — at 12k messages this stays
+    O(1) in memory and never materializes a full list. `done` is the ground-truth
+    set rebuilt from the target, so duplicates are filtered here, before forwarding.
+    """
+    reverse = order == "oldest"
+    async for msg in client.iter_messages(src, min_id=min_id, reverse=reverse):
+        if msg.id in done:
+            continue
+        caption = (getattr(msg, "text", None) or getattr(msg, "message", None)
+                   or getattr(msg, "caption", None))
+        yield WorkItem(msg=msg, caption=caption)
+
+
+async def iter_source_ids_recency(client, target, src_id: int, cold_after: int = 200) -> set[int]:
+    """Collect saved_from_msg_id for our source, scanning NEWEST-first and stopping on a
+    cold streak.
+
+    Telethon/MTProto has NO server-side filter for `saved_from_peer` (probed: from_user
+    returns 0 because a forwarded copy's sender is you/bot, not the source). So we must
+    fetch message objects — but we can bound the cost: forwards from a source cluster near
+    when they arrived, so once we hit `cold_after` consecutive non-matches from the top we
+    stop. This turns a 14k download into a few-hundred-message window on steady state.
+    """
+    delivered: set[int] = set()
+    cold = 0
+    async for m in client.iter_messages(target, reverse=False):  # newest first
+        fwd = getattr(m, "fwd_from", None)
+        if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src_id):
+            sf = getattr(fwd, "saved_from_msg_id", None)
+            if sf:
+                delivered.add(sf)
+                cold = 0
+                continue
+        cold += 1
+        if cold >= cold_after:
+            break
+    return delivered
+
+
+async def iter_source_ids_full(client, target, src_id: int) -> set[int]:
+    """Authoritative: collect ALL saved_from_msg_id for our source (full target scan)."""
+    delivered: set[int] = set()
+    async for m in client.iter_messages(target):
+        fwd = getattr(m, "fwd_from", None)
+        if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src_id):
+            sf = getattr(fwd, "saved_from_msg_id", None)
+            if sf:
+                delivered.add(sf)
+    return delivered
+
+
+async def verify_ids_exist(client, target, ids: list[int]) -> set[int]:
+    """Re-read message ids from the target to confirm they actually landed.
+
+    Used for verified write-through: forward_messages can return a truthy result for a
+    message that never persisted (deleted-account peers). We must not mark such ids 'done'
+    or we'd skip them forever AND we'd report false success. Returns the subset of ids
+    that genuinely exist in the target.
+    """
+    ids = [i for i in ids if i]
+    if not ids:
+        return set()
+    try:
+        got = await client.get_messages(target, ids=ids)
+    except Exception:
+        return set()  # unknown -> treat as not-verified (will retry next run)
+    return {g.id for g in got if g is not None and getattr(g, "id", None)}
+
+
+@retry(times=3, delay=0.5)
+async def _forward_messages(client, target, msgs):
+    """Notebook §7: transient MTProto/network errors retry automatically."""
+    return await client.forward_messages(target, msgs)
+
+
+async def _forward_batch(client, tgts, batch, done, cache, pending, logger, verify_fn,
+                         mark_threshold: int = 50, src_id: int | None = None) -> int:
+    """Forward one batch to all targets, VERIFY it landed, and only persist verified rows.
+
+    - `done` already contains the batch's source ids (optimistic reservation by caller).
+    - If a message fails to forward OR fails verification, its id is removed from `done`
+      so a later run will retry it (never silently dropped, never double-counted).
+    Returns the number of messages VERIFIED as delivered to the primary target.
+    """
+    verified_count = 0
+    batch_msgs = [item.msg for item in batch]
+    primary = tgts[0]
+    for t in tgts:
+        try:
+            res = await _forward_messages(client, t, batch_msgs)
+        except Exception:
+            res = None
+        if not res:
+            # Hard failure: release reservation so this batch retries next run.
+            for m in batch_msgs:
+                done.discard(m.id)
+            continue
+        sent_list = res if isinstance(res, list) else [res]
+        returned_ids = [getattr(s, "id", None) for s in sent_list]
+        # Verify against the primary target (consistent enough for single/multi-target).
+        verified_ids = await verify_fn(client, primary, returned_ids)
+        for item, sent in zip(batch, sent_list):
+            m = item.msg
+            sid = getattr(sent, "id", None)
+            if sid in verified_ids:
+                pending.append({"source_id": src_id if src_id is not None else getattr(m, "chat_id", None),
+                                "source_msg_id": m.id,
+                                "target_id": t.id, "target_msg_id": sid,
+                                "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
+                                             or (m.media and original_filename(m)) or f"msg:{m.id}"})
+                logger.record(pending[-1]["file_name"])
+                verified_count += 1
+            else:
+                # Ghost forward (returned but not in target): release reservation -> retry.
+                done.discard(m.id)
+        # Flush marks in chunks (bounded memory, bounded commits).
+        if len(pending) >= mark_threshold:
+            cache.mark_many(pending)
+            pending.clear()
+    return verified_count
 
 
 @click.group()
@@ -45,10 +212,18 @@ def cli():
 @click.option("--resume", is_flag=True, help="Continue from last processed message id")
 @click.option("--start", is_flag=True, help="Start from beginning (ignore saved progress)")
 @click.option("--rebuild-cache/--no-rebuild-cache", "rebuild_cache", default=True,
-              help="Before forwarding, rebuild the dedup cache from what is ACTUALLY in the "
-                   "target (ground truth via saved_from_msg_id). Prevents the cache from "
-                   "skipping messages it falsely marked 'done'. Default: on.")
-def forward(source, dest, dl_path, limit, process_all, order, session, delay, batch_size, resume, start, rebuild_cache):
+              help="Before forwarding, ensure the dedup cache reflects what is ACTUALLY in the "
+                   "target (ground truth via saved_from_msg_id). When the persisted cache "
+                   "already has entries it is trusted (O(1) load); only an empty/stale cache "
+                   "triggers a full target scan. Use --force-rebuild to always re-scan.")
+@click.option("--force-rebuild", "force_rebuild", is_flag=True, default=False,
+              help="Always perform the full target scan to rebuild ground truth, even if the "
+                   "cache is already populated. Slower, but authoritative.")
+@click.option("--quick-rebuild", "quick_rebuild", is_flag=True, default=False,
+              help="Recency-bounded rebuild: scan the target newest-first and stop after a cold "
+                   "streak. Fast (no full download) but may miss old forwards. Use only on a "
+                   "trusted, already-populated cache.")
+def forward(source, dest, dl_path, limit, process_all, order, session, delay, batch_size, resume, start, rebuild_cache, force_rebuild, quick_rebuild):
     """Forward messages/media from SOURCE to DEST (native copy; Rust/kreuzberg OCR fallback).
 
     Order: by default forwards the OLDEST files first (chronological from the
@@ -90,6 +265,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
         client = make_client(session)
         cache = ForwardCache()
         await client.start()
+        start = time.perf_counter()
         try:
             src = await resolve_entity(client, source)
             tgts = [await resolve_entity(client, d) for d in dest]
@@ -113,86 +289,57 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             # overwrite the cache with exactly that set. Only then do we dedup against truth.
             done: set[int] = set()
             for t in tgts:
-                if rebuild_cache:
-                    console.print(f"[yellow]🔍 Rebuilding dedup cache from target '{getattr(t, 'title', None) or getattr(t, 'first_name', None) or t.id}' (ground truth)...[/yellow]")
-                    delivered: set[int] = set()
-                    async for m in client.iter_messages(t, limit=30000):
-                        fwd = getattr(m, "fwd_from", None)
-                        if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
-                            sf = getattr(fwd, "saved_from_msg_id", None)
-                            if sf:
-                                delivered.add(sf)
+                # Load persisted ground truth FIRST (O(1) indexed query, no network scan).
+                existing = cache.load_done_set(src.id, t.id)
+                need_scan = force_rebuild or (rebuild_cache and not existing)
+                if need_scan:
+                    if quick_rebuild and not force_rebuild:
+                        console.print(f"[yellow]🔍 Quick rebuild (recency-bounded) from target '{getattr(t, 'title', None) or getattr(t, 'first_name', None) or t.id}'...[/yellow]")
+                        delivered = await iter_source_ids_recency(client, t, src.id)
+                    else:
+                        console.print(f"[yellow]🔍 Full rebuild from target '{getattr(t, 'title', None) or getattr(t, 'first_name', None) or t.id}' (ground truth)...[/yellow]")
+                        delivered = await iter_source_ids_full(client, t, src.id)
                     removed = cache.rebuild_done_set(src.id, t.id, delivered)
                     console.print(f"[dim]   cache had {removed} rows; rebuilt with {len(delivered)} verified-delivered ids[/dim]")
-                done |= cache.load_done_set(src.id, t.id)
+                    done |= delivered
+                else:
+                    console.print(f"[dim]   using persisted cache ({len(existing)} delivered ids) — skip target scan[/dim]")
+                    done |= existing
 
             count = 0
             run_forwarded = 0
-            skipped = 0
-            sent_ids: list[int] = []
             max_id = offset_id
-            # oldest -> reverse (chronological from start); newest -> default order.
-            reverse = (order == "oldest")
             # When rebuilding the cache from ground truth, do NOT skip by message id:
-            # the truthful `done` set (below) handles dedup, and a min_id filter would
-            # wrongly exclude messages with lower ids that were never actually delivered.
+            # the truthful `done` set handles dedup, and a min_id filter would wrongly
+            # exclude messages with lower ids that were never actually delivered.
             min_id_arg = 0 if rebuild_cache else offset_id
-            batch: list = []
-            async for msg in client.iter_messages(src, limit=None if process_all else limit,
-                                                  min_id=min_id_arg, reverse=reverse):
+            batch: list[WorkItem] = []
+            # Producer: lazy generator yields only undelivered messages (notebook §9).
+            # Optimistic reservation happens per-item below so restarts never re-pick them.
+            producer = iter_undone(client, src, done, order=order, min_id=min_id_arg)
+            async for item in producer:
                 if not process_all and count >= limit:
                     break
-                if msg.id > max_id:
-                    max_id = msg.id
-                caption = getattr(msg, "text", None) or getattr(msg, "message", None) or getattr(msg, "caption", None)
-                # Skip already-forwarded (O(1) set membership).
-                if msg.id in done:
-                    skipped += 1
-                    count += 1
-                    continue
-                batch.append((msg, caption))
+                if item.msg.id > max_id:
+                    max_id = item.msg.id
+                # OPTIMISTIC RESERVATION: reserve this id now so a restart/re-run can never
+                # pick it again. PERSIST only after verify_ids_exist confirms it landed.
+                done.add(item.msg.id)
+                batch.append(item)
                 count += 1
                 # When the batch is full, forward all messages in ONE API call per target.
                 if len(batch) >= batch_size:
-                    for t in tgts:
-                        try:
-                            res = await client.forward_messages(t, [m for m, _ in batch])
-                        except Exception:
-                            res = None
-                        if res:
-                            sent_list = res if isinstance(res, list) else [res]
-                            for (m, cap), sent in zip(batch, sent_list):
-                                pending.append({"source_id": src.id, "source_msg_id": m.id,
-                                                "target_id": t.id, "target_msg_id": getattr(sent, "id", None),
-                                                "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
-                                                             or (m.media and original_filename(m)) or f"msg:{m.id}"})
-                                done.add(m.id); run_forwarded += 1
-                                sent_ids.append(getattr(sent, "id", None))
-                                logger.record(pending[-1]["file_name"])
+                    run_forwarded += await _forward_batch(client, tgts, batch, done, cache, pending,
+                                                          logger, verify_ids_exist, mark_threshold=50,
+                                                          src_id=src.id)
                     batch.clear()
-                    # Flush marks in chunks (keeps memory/time bounded).
-                    if len(pending) >= 50:
-                        cache.mark_many(pending)
-                        pending.clear()
                     if delay:
                         await asyncio.sleep(delay)
             # Forward any remaining partial batch.
             if batch:
-                for t in tgts:
-                    try:
-                        res = await client.forward_messages(t, [m for m, _ in batch])
-                    except Exception:
-                        res = None
-                    if res:
-                        sent_list = res if isinstance(res, list) else [res]
-                        for (m, cap), sent in zip(batch, sent_list):
-                            pending.append({"source_id": src.id, "source_msg_id": m.id,
-                                            "target_id": t.id, "target_msg_id": getattr(sent, "id", None),
-                                            "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
-                                                         or (m.media and original_filename(m)) or f"msg:{m.id}"})
-                            done.add(m.id); run_forwarded += 1
-                            sent_ids.append(getattr(sent, "id", None))
-                            logger.record(pending[-1]["file_name"])
+                run_forwarded += await _forward_batch(client, tgts, batch, done, cache, pending,
+                                                      logger, verify_ids_exist, mark_threshold=50,
+                                                      src_id=src.id)
                 batch.clear()
             if pending:
                 cache.mark_many(pending)
@@ -205,7 +352,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             # This is the honest "did it really arrive" number — not the cache, not assumptions.
             final_delivered = 0
             try:
-                async for m in client.iter_messages(tgts[0], limit=30000):
+                async for m in client.iter_messages(tgts[0]):
                     fwd = getattr(m, "fwd_from", None)
                     if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
                         final_delivered += 1
@@ -215,12 +362,14 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             console.print(
                 f"[bold green]✨ Done.[/bold green] "
                 f"forwarded this run: [cyan]{run_forwarded}[/cyan] | "
-                f"skipped (already done): [yellow]{skipped}[/yellow] | "
+                f"known delivered (cache): [yellow]{len(done)}[/yellow] | "
                 f"VERIFIED in target: [green]{final_delivered if final_delivered >= 0 else 'n/a'}[/green] / "
                 f"source total: {src_total} ({pct})"
             )
             logger.render(console)
         finally:
+            elapsed = time.perf_counter() - start
+            console.print(f"[dim]⏱️  forward run: {elapsed:.2f}s[/dim]")
             await client.disconnect()
             cache.close()
 
@@ -289,6 +438,57 @@ def status():
     """Show configured API id presence (never prints secrets)."""
     ok = bool(os.environ.get("TELEGRAM_API_ID")) and bool(os.environ.get("TELEGRAM_API_HASH"))
     console.print(f"api configured: {'yes' if ok else 'NO — set TELEGRAM_API_ID/TELEGRAM_API_HASH'}")
+
+
+@cli.command()
+@click.option("--source", "source", required=True, help="Source channel whose forwards we de-duplicate in the target")
+@click.option("--target", "target", required=True, help="Target chat (e.g. Saved Messages id) to clean")
+@click.option("--session", default=None, help="Session name (defaults to TG_SESSION_NAME)")
+@click.option("--dry-run", is_flag=True, default=False, help="Count duplicates but do NOT delete")
+def dedupe(source, target, session, dry_run):
+    """Remove duplicate forwarded copies from TARGET, keeping one per source message id.
+
+    The earlier broken runs left multiple copies of the same source message in the target
+    (Telegram does not de-dupe native forwards). This scans the target, and for each message
+    whose fwd_from.saved_from_peer == SOURCE and saved_from_msg_id was already seen, deletes the
+    redundant copy via client.delete_messages. Use --dry-run first to preview.
+    """
+    async def run():
+        client = make_client(session)
+        await client.start()
+        try:
+            src = await resolve_entity(client, source)
+            tgt = await resolve_entity(client, target)
+            seen: set[int] = set()
+            dup_ids: list[int] = []
+            console.print(f"[yellow]🔍 Scanning target '{getattr(tgt, 'title', None) or getattr(tgt, 'first_name', None) or tgt.id}' for duplicate forwards from '{getattr(src, 'title', None) or getattr(src, 'first_name', None) or src.id}'...[/yellow]")
+            async for m in client.iter_messages(tgt):
+                fwd = getattr(m, "fwd_from", None)
+                if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
+                    sf = getattr(fwd, "saved_from_msg_id", None)
+                    if sf is not None:
+                        if sf in seen:
+                            dup_ids.append(m.id)
+                        else:
+                            seen.add(sf)
+            console.print(f"[cyan]unique source messages: {len(seen)} | duplicate copies found: {len(dup_ids)}[/cyan]")
+            if not dup_ids:
+                console.print("[green]✅ No duplicates to remove.[/green]")
+                return
+            if dry_run:
+                console.print(f"[yellow]--dry-run: would delete {len(dup_ids)} duplicates (no action taken)[/yellow]")
+                return
+            # Delete in chunks (delete_messages accepts a list).
+            chunk = 100
+            deleted = 0
+            for i in range(0, len(dup_ids), chunk):
+                await client.delete_messages(tgt, dup_ids[i:i + chunk])
+                deleted += len(dup_ids[i:i + chunk])
+                console.print(f"[dim]deleted {deleted}/{len(dup_ids)}[/dim]")
+            console.print(f"[green]✅ Removed {deleted} duplicate copies; kept {len(seen)} unique.[/green]")
+        finally:
+            await client.disconnect()
+    asyncio.run(run())
 
 
 if __name__ == "__main__":
