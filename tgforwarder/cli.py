@@ -380,22 +380,61 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             if pending:
                 cache.mark_many(pending)
                 pending.clear()
-            # ---- COPY MODE (protected chats) ----
-            # No forward API works -> download each msg + re-post via send_message.
-            # Dedup by content hash (no saved_from_peer). For text-only msgs, send_message
-            # is fast; for media, download to temp dir then upload to each target.
+            # ---- COPY MODE (protected chats, BATCHED download→upload→delete) ----
+            # No forward API works -> download each msg + re-post via send_message. To keep disk
+            # flat at 65k+ scale, we process in batches: download a batch's media, upload to all
+            # targets that lack each hash, then PERMANENTLY delete the batch's temp files before
+            # fetching the next batch. Dedup by content hash (no saved_from_peer in copy mode).
             if copy_mode:
-                import tempfile
+                import tempfile, os as _os
                 copy_pending: list[dict] = []
+                copy_batch: list = []          # collected (msg, hash, text, media_path) tuples
+                temp_paths: list[str] = []    # files to delete after this batch uploads
                 copy_reverse = (order == "oldest")
                 copy_min_id = 0 if rebuild_cache else offset_id
+
+                async def _flush_copy_batch():
+                    """Upload the current copy batch to all targets, mark, then delete temp files."""
+                    nonlocal run_forwarded
+                    for msg, h, text, media_path in copy_batch:
+                        for t in tgts:
+                            if h in done_by_target.get(t.id, set()):
+                                continue  # already delivered to this target
+                            try:
+                                sent = (await client.send_message(t, message=text, file=media_path)
+                                        if media_path else await client.send_message(t, message=text))
+                                if sent:
+                                    done_by_target[t.id].add(h)
+                                    run_forwarded += 1
+                                    copy_pending.append({"source_id": src.id, "source_msg_id": msg.id,
+                                                         "target_id": t.id, "target_msg_id": sent.id,
+                                                         "file_name": original_filename(msg),
+                                                         "content_hash": h})
+                                    logger.record(original_filename(msg))
+                            except Exception as e:
+                                console.print(f"[yellow]⚠️  send to target {t.id} failed (msg {msg.id}): {e}[/yellow]")
+                                # do NOT add to done_by_target -> retries next run
+                            if delay:
+                                await asyncio.sleep(delay)
+                    # Persist cache marks for this batch.
+                    if copy_pending:
+                        cache.mark_many(copy_pending)
+                        copy_pending.clear()
+                    # PERMANENTLY delete every downloaded temp file for this batch.
+                    for p in temp_paths:
+                        try:
+                            _os.unlink(p)
+                        except OSError:
+                            pass
+                    temp_paths.clear()
+                    copy_batch.clear()
+
                 async for msg in client.iter_messages(src, min_id=copy_min_id, reverse=copy_reverse):
                     if not process_all and count >= limit:
                         break
                     if msg.id > max_id:
                         max_id = msg.id
                     h = content_hash_of(msg)
-                    # Skip only if every target already has this content hash (use cache-loaded sets).
                     if all(h in s for s in done_by_target.values()):
                         continue
                     text = (getattr(msg, "message", None) or getattr(msg, "text", None)
@@ -403,37 +442,22 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                     media_path = None
                     if msg.media:
                         try:
-                            media_path = await client.download_media(msg, file=tempfile.NamedTemporaryFile(delete=False, suffix=Path(original_filename(msg)).suffix).name)
+                            tf = tempfile.NamedTemporaryFile(delete=False, suffix=Path(original_filename(msg)).suffix)
+                            tf.close()
+                            media_path = await client.download_media(msg, file=tf.name)
+                            if media_path:
+                                temp_paths.append(str(media_path))
                         except Exception as e:
                             console.print(f"[yellow]⚠️  download failed for msg {msg.id}: {e}[/yellow]")
                             continue
-                    # Send to each target that lacks this hash. Reserve to that target ONLY on success.
-                    for t in tgts:
-                        if h in done_by_target.get(t.id, set()):
-                            continue  # already delivered to this target
-                        try:
-                            sent = (await client.send_message(t, message=text, file=media_path)
-                                    if media_path else await client.send_message(t, message=text))
-                            if sent:
-                                done_by_target[t.id].add(h)
-                                run_forwarded += 1
-                                copy_pending.append({"source_id": src.id, "source_msg_id": msg.id,
-                                                     "target_id": t.id, "target_msg_id": sent.id,
-                                                     "file_name": original_filename(msg),
-                                                     "content_hash": h})
-                                logger.record(original_filename(msg))
-                        except Exception as e:
-                            console.print(f"[yellow]⚠️  send to target {t.id} failed: {e}[/yellow]")
-                            # do NOT add to done_by_target -> retries next run
-                        if delay:
-                            await asyncio.sleep(delay)
+                    copy_batch.append((msg, h, text, media_path))
                     count += 1
-                    if len(copy_pending) >= 50:
-                        cache.mark_many(copy_pending)
-                        copy_pending.clear()
-                if copy_pending:
-                    cache.mark_many(copy_pending)
-                    copy_pending.clear()
+                    # Download→upload→delete once the batch is full (flat disk footprint).
+                    if len(copy_batch) >= batch_size:
+                        await _flush_copy_batch()
+                # Flush any remaining partial batch.
+                if copy_batch:
+                    await _flush_copy_batch()
             # Persist resume point + direction
             fstate.set_progress(st, source, max_id, direction=order)
             fstate.save_state(st)
