@@ -45,11 +45,16 @@ uv tool install "git+https://github.com/dbillion/tgforwarder.git@v0.1.0"
 uvx --from "git+https://github.com/dbillion/tgforwarder.git@v0.1.0" tgf --help
 ```
 
-**npx skills — install the agent skill (no npm publish needed):**
+**npx skills — install the agent skills (no npm publish needed):**
 
 ```bash
-npx skills --skill dbillion/tgforwarder/tgf-agent-install
+npx skills add dbillion/tgforwarder -y
 ```
+
+This clones the repo and installs both `tgf-agent-install` and `tgf-telegram-forwarder-setup`
+into `.agents/skills/` (works with Claude Code, Codex, Cursor, Cline, Antigravity, OpenClaw, +more).
+(Note: the `skills` CLI uses `add <owner/repo>`, not `--skill` — that flag is from an older
+write-up and is not valid in current `skills`.)
 
 **npx wrapper — installs `tgf` via uv (alt):** `npx -y tgf-forwarder` (see `installer/`).
 
