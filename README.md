@@ -30,15 +30,28 @@ pushed**. Always confirm with `git status --short | grep '.env'` before committi
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/) (same mechanism as `tg-cli`). Two one-line
-global installs:
+Requires [uv](https://docs.astral.sh/uv/) (same mechanism as `tg-cli`). Pick one:
 
-**uv (recommended, no clone needed):**
+**uv — pinned release (recommended, reproducible, no clone):**
 
 ```bash
-uv tool install "git+https://github.com/dbillion/tgforwarder.git"
+uv tool install "git+https://github.com/dbillion/tgforwarder.git@v0.1.0"
 # -> installs the global `tgf` command (~/.local/bin/tgf)
 ```
+
+**uvx — run without installing (CI / one-off):**
+
+```bash
+uvx --from "git+https://github.com/dbillion/tgforwarder.git@v0.1.0" tgf --help
+```
+
+**npx skills — install the agent skill (no npm publish needed):**
+
+```bash
+npx skills --skill dbillion/tgforwarder/tgf-agent-install
+```
+
+**npx wrapper — installs `tgf` via uv (alt):** `npx -y tgf-forwarder` (see `installer/`).
 
 **From a clone:**
 
@@ -47,9 +60,6 @@ git clone https://github.com/dbillion/tgforwarder.git && cd tgforwarder
 uv tool install . --no-cache
 which tgf                          # -> ~/.local/bin/tgf
 ```
-
-**npx (agent-friendly wrapper):** `npx -y tgf-forwarder` installs `tgf` via the uv
-one-liner above (requires `uv` on PATH). See `installer/package.json`.
 
 For local development:
 
