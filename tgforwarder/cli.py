@@ -39,16 +39,19 @@ def cli():
 @click.option("--order", "order", type=click.Choice(["oldest", "newest"]), default="oldest",
               help="Forward order. Default: oldest (chronological from channel start)")
 @click.option("--session", default=None, help="Session name (default: forwarder_session1)")
-@click.option("--delay", default=1.0, help="Seconds between messages (anti-ban)")
+@click.option("--delay", default=1.0, help="Seconds between BATCHES (anti-ban); one API call per batch")
+@click.option("--batch", "batch_size", default=25, help="Messages per forward API call (one call moves the whole batch)")
 @click.option("--resume", is_flag=True, help="Continue from last processed message id")
 @click.option("--start", is_flag=True, help="Start from beginning (ignore saved progress)")
-def forward(source, dest, dl_path, limit, process_all, order, session, delay, resume, start):
-    """Download media from SOURCE, OCR-rename (Rust/kreuzberg), re-upload to DEST.
+def forward(source, dest, dl_path, limit, process_all, order, session, delay, batch_size, resume, start):
+    """Forward messages/media from SOURCE to DEST (native copy; Rust/kreuzberg OCR fallback).
 
     Order: by default forwards the OLDEST files first (chronological from the
     channel's start). Use --order newest for most-recent-first. With no args,
     launches an interactive menu (oldest/newest, start/resume, config).
     Source/dest/path can be preset in .env (SOURCE_CHANNELS/DEST_CHANNELS/FORWARD_PATH).
+    Batches many messages into one API call (--batch) to maximize throughput while
+    staying under the rate limit (--delay applies per batch).
     """
     # Resolve from env first; go interactive only if BOTH still unset.
     if not source:
@@ -98,6 +101,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, re
             max_id = offset_id
             # oldest -> reverse (chronological from start); newest -> default order.
             reverse = (order == "oldest")
+            batch: list = []
             async for msg in client.iter_messages(src, limit=None if process_all else limit,
                                                   min_id=offset_id, reverse=reverse):
                 if not process_all and count >= limit:
@@ -105,55 +109,52 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, re
                 if msg.id > max_id:
                     max_id = msg.id
                 caption = getattr(msg, "text", None) or getattr(msg, "message", None) or getattr(msg, "caption", None)
-                for t in tgts:
-                    if msg.id in done:
-                        continue
-                    sent = None
-                    # Primary: native Telegram forward (exact, instant, preserves files;
-                    # required for deleted-account chats where download/send is unreliable).
-                    try:
-                        res = await client.forward_messages(t, msg)
-                        sent = res[0] if isinstance(res, list) else res
-                    except Exception:
-                        sent = None
-                    # Fallback: download + re-upload (enables OCR-renaming).
-                    if sent is None:
-                        if msg.media:
-                            dl = await client.download_media(msg, str(dl_dir / original_filename(msg)))
-                            if dl:
-                                text, suggested = extract_text(dl)
-                                final = dl
-                                if suggested:
-                                    new = Path(dl).parent / suggested
-                                    try:
-                                        Path(dl).rename(new); final = str(new)
-                                    except Exception:
-                                        pass
-                                try:
-                                    sent = await client.send_file(t, final, caption=caption, force_document=True)
-                                except Exception:
-                                    sent = None
-                                if os.path.exists(final):
-                                    os.remove(final)
-                        elif caption:
-                            try:
-                                sent = await client.send_message(t, caption)
-                            except Exception:
-                                sent = None
-                    if sent is not None:
-                        pending.append({"source_id": src.id, "source_msg_id": msg.id,
-                                        "target_id": t.id, "target_msg_id": getattr(sent, "id", None),
-                                        "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
-                                                     or (msg.media and original_filename(msg)) or f"msg:{msg.id}"})
-                        done.add(msg.id)
-                        logger.record(pending[-1]["file_name"])
-                # Flush marks in chunks (one transaction per 50) — keeps memory/time bounded.
-                if len(pending) >= 50:
-                    cache.mark_many(pending)
-                    pending.clear()
+                # Skip already-forwarded (O(1) set membership).
+                if msg.id in done:
+                    count += 1
+                    continue
+                batch.append((msg, caption))
                 count += 1
-                if delay:
-                    await asyncio.sleep(delay)
+                # When the batch is full, forward all messages in ONE API call per target.
+                if len(batch) >= batch_size:
+                    for t in tgts:
+                        try:
+                            res = await client.forward_messages(t, [m for m, _ in batch])
+                        except Exception:
+                            res = None
+                        if res:
+                            sent_list = res if isinstance(res, list) else [res]
+                            for (m, cap), sent in zip(batch, sent_list):
+                                pending.append({"source_id": src.id, "source_msg_id": m.id,
+                                                "target_id": t.id, "target_msg_id": getattr(sent, "id", None),
+                                                "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
+                                                             or (m.media and original_filename(m)) or f"msg:{m.id}"})
+                                done.add(m.id)
+                                logger.record(pending[-1]["file_name"])
+                    batch.clear()
+                    # Flush marks in chunks (keeps memory/time bounded).
+                    if len(pending) >= 50:
+                        cache.mark_many(pending)
+                        pending.clear()
+                    if delay:
+                        await asyncio.sleep(delay)
+            # Forward any remaining partial batch.
+            if batch:
+                for t in tgts:
+                    try:
+                        res = await client.forward_messages(t, [m for m, _ in batch])
+                    except Exception:
+                        res = None
+                    if res:
+                        sent_list = res if isinstance(res, list) else [res]
+                        for (m, cap), sent in zip(batch, sent_list):
+                            pending.append({"source_id": src.id, "source_msg_id": m.id,
+                                            "target_id": t.id, "target_msg_id": getattr(sent, "id", None),
+                                            "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
+                                                         or (m.media and original_filename(m)) or f"msg:{m.id}"})
+                            done.add(m.id)
+                            logger.record(pending[-1]["file_name"])
+                batch.clear()
             if pending:
                 cache.mark_many(pending)
                 pending.clear()

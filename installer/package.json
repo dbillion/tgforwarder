@@ -1,0 +1,19 @@
+{
+  "name": "tgf-forwarder",
+  "version": "0.1.0",
+  "description": "npx wrapper that installs the tgf Telegram forwarder via uv (uv tool install).",
+  "bin": {
+    "tgf-forwarder": "tgf-forwarder.mjs"
+  },
+  "scripts": {
+    "postinstall": "node tgf-forwarder.mjs"
+  },
+  "keywords": ["telegram", "forwarder", "tgf", "uv", "cli"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "tgf-forwarder.mjs"
+  ]
+}

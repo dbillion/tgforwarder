@@ -30,13 +30,26 @@ pushed**. Always confirm with `git status --short | grep '.env'` before committi
 
 ## Install
 
-Requires [uv](https://docs.astral.sh/uv/) (same mechanism as `tg-cli`).
+Requires [uv](https://docs.astral.sh/uv/) (same mechanism as `tg-cli`). Two one-line
+global installs:
+
+**uv (recommended, no clone needed):**
 
 ```bash
-cd tgforwarder
-uv tool install . --no-cache      # installs the global `tgf` command
+uv tool install "git+https://github.com/dbillion/tgforwarder.git"
+# -> installs the global `tgf` command (~/.local/bin/tgf)
+```
+
+**From a clone:**
+
+```bash
+git clone https://github.com/dbillion/tgforwarder.git && cd tgforwarder
+uv tool install . --no-cache
 which tgf                          # -> ~/.local/bin/tgf
 ```
+
+**npx (agent-friendly wrapper):** `npx -y tgf-forwarder` installs `tgf` via the uv
+one-liner above (requires `uv` on PATH). See `installer/package.json`.
 
 For local development:
 
@@ -63,8 +76,8 @@ Create `tgforwarder/.env` (gitignored — do **not** commit it):
 TELEGRAM_API_ID=your_api_id
 TELEGRAM_API_HASH=your_api_hash
 TG_SESSION_NAME=forwarder_session1
-SOURCE_CHANNELS=-1001961116802        # source channel(s), comma-separated
-DEST_CHANNELS=-1002316727504,-1002110989561   # destination(s), comma-separated
+SOURCE_CHANNELS=-1000000000000        # source channel(s), comma-separated
+DEST_CHANNELS=-1000000000001,-1000000000002   # destination(s), comma-separated
 FORWARD_PATH=downloads               # local download dir for the OCR fallback
 ```
 
@@ -74,7 +87,7 @@ one with a Telethon login helper. One session at a time (a concurrent sync holds
 lock).
 
 > **Tip:** to forward to your **Saved Messages**, use your own user ID as the destination,
-> e.g. `--dest 1255087768` (replace with your ID from `tgf score`/`get_me`).
+> e.g. `--dest <YOUR_USER_ID>` (your Saved Messages user id from `tgf score`/`get_me`).
 
 ---
 
@@ -85,10 +98,10 @@ lock).
 tgf forward
 
 # Explicit, oldest-first (default), 10 messages:
-tgf forward --source -1001961116802 --dest 1255087768 --limit 10
+tgf forward --source <SOURCE_CHANNEL> --dest <YOUR_USER_ID> --limit 10
 
 # Forward EVERYTHING, chronological from the channel start:
-tgf forward --source 558372819 --dest 1255087768 --all --delay 3
+tgf forward --source <SOURCE_CHANNEL> --dest <YOUR_USER_ID> --all --delay 1 --batch 25
 
 # Resume a previous run (continues from saved last-message id):
 tgf forward --resume
@@ -100,7 +113,7 @@ tgf forward --order newest --limit 50
 tgf score --db ~/.local/share/tg-cli/messages.db --topic "rust,devops,ai" --top 5
 
 # OCR-only check (read-only, needs a numeric channel ID):
-tgf test-ocr --source 1039626561
+tgf test-ocr --source <SOURCE_CHANNEL>
 ```
 
 ### Options (`tgf forward --help`)
@@ -115,7 +128,16 @@ tgf test-ocr --source 1039626561
 | `--limit N` | Cap messages (ignored with `--all`) |
 | `--resume` | Continue from last forwarded message id |
 | `--start` | Start from the beginning (ignore saved progress) |
-| `--delay S` | Seconds between messages (anti-ban; default 1.0) |
+| `--delay S` | Seconds between **batches** (anti-ban; default 1.0) |
+| `--batch N` | Messages per forward API call — one call moves the whole batch (default 25). Raise for speed, lower if rate-limited |
+
+#### Throughput
+
+`tgf` batches `N` messages into a **single** `forward_messages` API call, so throughput is
+`N` files per call. With `--batch 25 --delay 1` you move ~25 files/second of wall-clock
+(one call + 1s pause). Telegram's copy endpoint can sustain far more; if you're not
+rate-limited, raise `--batch` (e.g. 50–100) and drop `--delay` toward 0. The dedup cache
+and O(1) `set` lookup keep per-message overhead flat at 5000+ files.
 
 ### Deleted-account chats
 
