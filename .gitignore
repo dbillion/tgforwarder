@@ -1,0 +1,24 @@
+# Python / build
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Secrets / local config (NEVER commit)
+.env
+.env.*
+*.session
+*.session-journal
+
+# Local data (SQLite caches)
+*.db
+*.db-journal
+messages.db
+forwarder.db
+
+# OS
+.DS_Store
