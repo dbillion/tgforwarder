@@ -1,6 +1,6 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgforwarder"
@@ -32,12 +32,8 @@ tgf = "tgforwarder.cli:cli"
 [project.urls]
 Homepage = "https://github.com/dbillion/tgforwarder"
 
-[tool.hatch.build.targets.wheel]
-packages = ["tgforwarder"]
-only-include = ["tgforwarder"]
-
-[tool.hatch.build]
-sources = ["tgforwarder"]
+[tool.setuptools.packages.find]
+include = ["tgforwarder*"]
 
 [tool.ruff]
 line-length = 100

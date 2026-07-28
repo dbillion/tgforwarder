@@ -137,3 +137,46 @@ def test_cache_no_duplicate_on_repeat(tmp_path):
     c.mark(source_id=10, source_msg_id=100, target_id=20, target_msg_id=2)  # UNIQUE ignored
     assert c.stats()["forwarded"] == 1
     c.close()
+
+
+# --------------------------------------------------------------------------
+# state (resume persistence)
+# --------------------------------------------------------------------------
+def test_state_roundtrip(tmp_path):
+    from tgforwarder import state
+    p = tmp_path / "st.json"
+    st = state.load_state(p)
+    assert state.last_id_for(st, "src1") == 0
+    state.set_last_id(st, "src1", 555)
+    state.save_state(st, p)
+    st2 = state.load_state(p)
+    assert state.last_id_for(st2, "src1") == 555
+
+
+# --------------------------------------------------------------------------
+# report.ForwardLogger
+# --------------------------------------------------------------------------
+def test_logger_counts_and_types():
+    from tgforwarder.report import ForwardLogger
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    l = ForwardLogger()
+    assert l.count() == 0
+    l.record("a.png", now)
+    l.record("b.pdf", now)
+    l.record("c.png", now)
+    assert l.count() == 3
+    assert l.by_type() == {"png": 2, "pdf": 1}
+
+
+def test_logger_recent_window_filters_old():
+    from tgforwarder.report import ForwardLogger
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(minutes=10)
+    l = ForwardLogger()
+    l.record("old.pdf", old)
+    l.record("new.png", now)
+    recent = l.recent_window(minutes=5)
+    assert len(recent) == 1
+    assert recent[0]["name"] == "new.png"

@@ -14,11 +14,9 @@ __pycache__/
 *.session
 *.session-journal
 
-# Local data (SQLite caches)
-*.db
-*.db-journal
-messages.db
-forwarder.db
+# Runtime artifacts
+.forward_state.json
+downloads/
 
 # OS
 .DS_Store
