@@ -106,6 +106,36 @@ class ForwardCache:
         )
         self.conn.commit()
 
+    def rebuild_done_set(self, source_id: int, target_id: int, delivered_ids: set[int]) -> int:
+        """Replace the cached 'done' set for a (source, target) pair with GROUND TRUTH.
+
+        The normal mark_many path can mark a message 'done' when forward_messages
+        returns truthy even if it never actually persisted (common with deleted-account
+        peers). That leaves the cache inflated and causes the forwarder to skip real
+        messages forever. This method overwrites the pair's rows with the set of
+        source_msg_ids that were VERIFIED to exist in the target (e.g. by scanning
+        Saved Messages for saved_from_msg_id). Use before a forward run to make dedup
+        honest.
+        """
+        cur = self.conn.execute(
+            "DELETE FROM forwarded WHERE source_id=? AND target_id=?",
+            (source_id, target_id),
+        )
+        deleted = cur.rowcount
+        if delivered_ids:
+            ts = datetime.now(timezone.utc).isoformat()
+            self.conn.executemany(
+                """INSERT INTO forwarded
+                   (source_id, source_msg_id, target_id, target_msg_id, file_name, timestamp, status)
+                   VALUES (?,?,?,?,?,?,?)""",
+                [
+                    (source_id, mid, target_id, None, None, ts, "ok")
+                    for mid in delivered_ids
+                ],
+            )
+        self.conn.commit()
+        return deleted
+
     def stats(self) -> dict:
         ok = self.conn.execute("SELECT COUNT(*) FROM forwarded WHERE status='ok'").fetchone()[0]
         failed = self.conn.execute(

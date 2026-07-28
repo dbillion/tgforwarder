@@ -16,6 +16,7 @@ from rich.console import Console
 from . import __version__
 from .client import make_client, resolve_entity
 from .cache import ForwardCache
+from telethon.tl.types import PeerUser
 from .forward import extract_text, original_filename
 from .score import score_chats, format_table, DEFAULT_DB
 from . import state as fstate
@@ -43,7 +44,11 @@ def cli():
 @click.option("--batch", "batch_size", default=25, help="Messages per forward API call (one call moves the whole batch)")
 @click.option("--resume", is_flag=True, help="Continue from last processed message id")
 @click.option("--start", is_flag=True, help="Start from beginning (ignore saved progress)")
-def forward(source, dest, dl_path, limit, process_all, order, session, delay, batch_size, resume, start):
+@click.option("--rebuild-cache/--no-rebuild-cache", "rebuild_cache", default=True,
+              help="Before forwarding, rebuild the dedup cache from what is ACTUALLY in the "
+                   "target (ground truth via saved_from_msg_id). Prevents the cache from "
+                   "skipping messages it falsely marked 'done'. Default: on.")
+def forward(source, dest, dl_path, limit, process_all, order, session, delay, batch_size, resume, start, rebuild_cache):
     """Forward messages/media from SOURCE to DEST (native copy; Rust/kreuzberg OCR fallback).
 
     Order: by default forwards the OLDEST files first (chronological from the
@@ -88,23 +93,53 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
         try:
             src = await resolve_entity(client, source)
             tgts = [await resolve_entity(client, d) for d in dest]
+            # Instant total message count for the source (no iteration needed).
+            try:
+                _zero = await client.get_messages(src, limit=0)
+                src_total = getattr(_zero, "total", None) or getattr(src, "message_count", None)
+            except Exception:
+                src_total = getattr(src, "message_count", None)
+            console.print(f"[dim]   source total messages (instant): {src_total}[/dim]")
             src_label = getattr(src, "title", None) or getattr(src, "first_name", None) or f"peer:{getattr(src, 'user_id', getattr(src, 'channel_id', source))}"
             console.print(f"[green]📥 Source:[/green] {src_label}  [green]📤 Dest:[/green] {', '.join(getattr(t, 'title', None) or getattr(t, 'first_name', None) or str(t) for t in tgts)}")
             console.print(f"[dim]   order: {order} | download dir: {dl_dir} | resume offset: {offset_id} | all: {process_all}[/dim]")
 
             # Fast dedup: load done msg_ids into a set (O(1) membership, no per-row SQL).
+            # SAFETY: the cache can be inflated if forward_messages returned truthy but the
+            # message never actually persisted (common with deleted-account peers). That
+            # makes us skip real messages forever. So when --rebuild-cache (default), we
+            # first derive GROUND TRUTH from the target: scan Saved/DMs for messages whose
+            # fwd_from.saved_from_peer == source, collect their saved_from_msg_id, and
+            # overwrite the cache with exactly that set. Only then do we dedup against truth.
             done: set[int] = set()
             for t in tgts:
+                if rebuild_cache:
+                    console.print(f"[yellow]🔍 Rebuilding dedup cache from target '{getattr(t, 'title', None) or getattr(t, 'first_name', None) or t.id}' (ground truth)...[/yellow]")
+                    delivered: set[int] = set()
+                    async for m in client.iter_messages(t, limit=30000):
+                        fwd = getattr(m, "fwd_from", None)
+                        if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
+                            sf = getattr(fwd, "saved_from_msg_id", None)
+                            if sf:
+                                delivered.add(sf)
+                    removed = cache.rebuild_done_set(src.id, t.id, delivered)
+                    console.print(f"[dim]   cache had {removed} rows; rebuilt with {len(delivered)} verified-delivered ids[/dim]")
                 done |= cache.load_done_set(src.id, t.id)
 
             count = 0
             run_forwarded = 0
+            skipped = 0
+            sent_ids: list[int] = []
             max_id = offset_id
             # oldest -> reverse (chronological from start); newest -> default order.
             reverse = (order == "oldest")
+            # When rebuilding the cache from ground truth, do NOT skip by message id:
+            # the truthful `done` set (below) handles dedup, and a min_id filter would
+            # wrongly exclude messages with lower ids that were never actually delivered.
+            min_id_arg = 0 if rebuild_cache else offset_id
             batch: list = []
             async for msg in client.iter_messages(src, limit=None if process_all else limit,
-                                                  min_id=offset_id, reverse=reverse):
+                                                  min_id=min_id_arg, reverse=reverse):
                 if not process_all and count >= limit:
                     break
                 if msg.id > max_id:
@@ -112,6 +147,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                 caption = getattr(msg, "text", None) or getattr(msg, "message", None) or getattr(msg, "caption", None)
                 # Skip already-forwarded (O(1) set membership).
                 if msg.id in done:
+                    skipped += 1
                     count += 1
                     continue
                 batch.append((msg, caption))
@@ -131,6 +167,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                                                 "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
                                                              or (m.media and original_filename(m)) or f"msg:{m.id}"})
                                 done.add(m.id); run_forwarded += 1
+                                sent_ids.append(getattr(sent, "id", None))
                                 logger.record(pending[-1]["file_name"])
                     batch.clear()
                     # Flush marks in chunks (keeps memory/time bounded).
@@ -154,6 +191,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                                             "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
                                                          or (m.media and original_filename(m)) or f"msg:{m.id}"})
                             done.add(m.id); run_forwarded += 1
+                            sent_ids.append(getattr(sent, "id", None))
                             logger.record(pending[-1]["file_name"])
                 batch.clear()
             if pending:
@@ -162,7 +200,25 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             # Persist resume point + direction
             fstate.set_progress(st, source, max_id, direction=order)
             fstate.save_state(st)
-            console.print(f"[bold green]✨ Done. forwarded this run: {run_forwarded} | cache total: {cache.stats()['forwarded']}[/bold green]")
+            # FINAL VERIFICATION (ground truth): re-scan the first target and count how many
+            # of its messages actually originated from the source (saved_from_peer == src).
+            # This is the honest "did it really arrive" number — not the cache, not assumptions.
+            final_delivered = 0
+            try:
+                async for m in client.iter_messages(tgts[0], limit=30000):
+                    fwd = getattr(m, "fwd_from", None)
+                    if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
+                        final_delivered += 1
+            except Exception:
+                final_delivered = -1
+            pct = (f"{final_delivered / src_total * 100:.1f}%" if (final_delivered >= 0 and src_total) else "n/a")
+            console.print(
+                f"[bold green]✨ Done.[/bold green] "
+                f"forwarded this run: [cyan]{run_forwarded}[/cyan] | "
+                f"skipped (already done): [yellow]{skipped}[/yellow] | "
+                f"VERIFIED in target: [green]{final_delivered if final_delivered >= 0 else 'n/a'}[/green] / "
+                f"source total: {src_total} ({pct})"
+            )
             logger.render(console)
         finally:
             await client.disconnect()

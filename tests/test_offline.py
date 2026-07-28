@@ -154,6 +154,29 @@ def test_cache_bulk_load_and_mark_many(tmp_path):
     c2.close()
 
 
+def test_cache_rebuild_done_set_replaces_inflated_cache(tmp_path):
+    """The cache must be replaceable with GROUND TRUTH (what's actually in the target).
+
+    Regression test: without rebuild, a cache inflated by false 'done' marks would
+    make the forwarder skip real messages forever. rebuild_done_set must overwrite
+    the pair's rows with exactly the delivered set.
+    """
+    db = tmp_path / "fwd4.db"
+    c = ForwardCache(db)
+    # Inflated: 100 ids marked done, but only 3 actually delivered.
+    c.mark_many([{"source_id": 10, "source_msg_id": i, "target_id": 20} for i in range(1, 101)])
+    assert c.stats()["forwarded"] == 100
+    # Ground truth from the target: only ids 5, 6, 7 really arrived.
+    removed = c.rebuild_done_set(10, 20, {5, 6, 7})
+    assert removed == 100
+    assert c.stats()["forwarded"] == 3
+    done = c.load_done_set(10, 20)
+    assert done == {5, 6, 7}
+    assert not c.is_done(10, 1, 20)   # false positive gone
+    assert c.is_done(10, 5, 20)       # truth kept
+    c.close()
+
+
 # --------------------------------------------------------------------------
 # state (resume persistence)
 # --------------------------------------------------------------------------
