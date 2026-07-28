@@ -1,0 +1,34 @@
+name: Issue triage
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  greet:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Label & acknowledge
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const body = (issue.body || "").toLowerCase();
+            const labels = issue.labels.map(l => l.name);
+            // Remind about secrets on any issue that might contain them.
+            if (/api[_-]?id|api[_-]?hash|session|\.env|access[_-]?hash/i.test(issue.body || "")) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body: "⚠️ Heads up: this issue may contain secrets (API id/hash, session, .env). Please redact and edit them out — they should never be shared. The maintainers will not ask for them."
+              });
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              body: "Thanks for opening this! A maintainer will take a look. If you can, include the `tgf` command you ran, the output (redacted), and your OS/Python version."
+            });

@@ -104,40 +104,49 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, re
                     break
                 if msg.id > max_id:
                     max_id = msg.id
-                caption = getattr(msg, "text", None) or getattr(msg, "caption", None)
-                if msg.media:
-                    dl = await client.download_media(msg, str(dl_dir / original_filename(msg)))
-                    if not dl:
+                caption = getattr(msg, "text", None) or getattr(msg, "message", None) or getattr(msg, "caption", None)
+                for t in tgts:
+                    if msg.id in done:
                         continue
-                    # Batch OCR: collect paths, extract in one Rust-parallel call.
-                    text, suggested = extract_text(dl)
-                    final = dl
-                    if suggested:
-                        new = Path(dl).parent / suggested
-                        try:
-                            Path(dl).rename(new); final = str(new)
-                        except Exception:
-                            pass
-                    for t in tgts:
-                        if msg.id in done:
-                            continue
-                        sent = await client.send_file(t, final, caption=caption, force_document=True)
+                    sent = None
+                    # Primary: native Telegram forward (exact, instant, preserves files;
+                    # required for deleted-account chats where download/send is unreliable).
+                    try:
+                        res = await client.forward_messages(t, msg)
+                        sent = res[0] if isinstance(res, list) else res
+                    except Exception:
+                        sent = None
+                    # Fallback: download + re-upload (enables OCR-renaming).
+                    if sent is None:
+                        if msg.media:
+                            dl = await client.download_media(msg, str(dl_dir / original_filename(msg)))
+                            if dl:
+                                text, suggested = extract_text(dl)
+                                final = dl
+                                if suggested:
+                                    new = Path(dl).parent / suggested
+                                    try:
+                                        Path(dl).rename(new); final = str(new)
+                                    except Exception:
+                                        pass
+                                try:
+                                    sent = await client.send_file(t, final, caption=caption, force_document=True)
+                                except Exception:
+                                    sent = None
+                                if os.path.exists(final):
+                                    os.remove(final)
+                        elif caption:
+                            try:
+                                sent = await client.send_message(t, caption)
+                            except Exception:
+                                sent = None
+                    if sent is not None:
                         pending.append({"source_id": src.id, "source_msg_id": msg.id,
-                                        "target_id": t.id, "target_msg_id": sent.id if sent else None,
-                                        "file_name": final})
+                                        "target_id": t.id, "target_msg_id": getattr(sent, "id", None),
+                                        "file_name": (getattr(sent, "file", None) and getattr(sent.file, "name", None))
+                                                     or (msg.media and original_filename(msg)) or f"msg:{msg.id}"})
                         done.add(msg.id)
-                        logger.record(Path(final).name)
-                    if os.path.exists(final):
-                        os.remove(final)
-                elif caption:
-                    for t in tgts:
-                        if msg.id in done:
-                            continue
-                        sent = await client.send_message(t, caption)
-                        pending.append({"source_id": src.id, "source_msg_id": msg.id,
-                                        "target_id": t.id, "target_msg_id": sent.id if sent else None})
-                        done.add(msg.id)
-                        logger.record(f"text:{msg.id}")
+                        logger.record(pending[-1]["file_name"])
                 # Flush marks in chunks (one transaction per 50) — keeps memory/time bounded.
                 if len(pending) >= 50:
                     cache.mark_many(pending)
