@@ -85,7 +85,8 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, re
         try:
             src = await resolve_entity(client, source)
             tgts = [await resolve_entity(client, d) for d in dest]
-            console.print(f"[green]📥 Source:[/green] {src.title}  [green]📤 Dest:[/green] {', '.join(t.title for t in tgts)}")
+            src_label = getattr(src, "title", None) or getattr(src, "first_name", None) or f"peer:{getattr(src, 'user_id', getattr(src, 'channel_id', source))}"
+            console.print(f"[green]📥 Source:[/green] {src_label}  [green]📤 Dest:[/green] {', '.join(getattr(t, 'title', None) or getattr(t, 'first_name', None) or str(t) for t in tgts)}")
             console.print(f"[dim]   order: {order} | download dir: {dl_dir} | resume offset: {offset_id} | all: {process_all}[/dim]")
 
             # Fast dedup: load done msg_ids into a set (O(1) membership, no per-row SQL).

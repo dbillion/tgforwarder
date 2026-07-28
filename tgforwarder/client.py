@@ -48,17 +48,42 @@ def make_client(session: str | None = None) -> TelegramClient:
 
 
 async def resolve_entity(client: TelegramClient, name: str):
-    """Resolve a channel/user from a name, @handle, or numeric ID (handles -100 prefix)."""
-    if str(name).replace("-", "").isdigit():
+    """Resolve a channel/user from a name, @handle, or numeric ID (handles -100 prefix).
+
+    Falls back to a cached dialog peer: deleted-account chats (PeerUser with no
+    server entity) can't be resolved by ID, but the session's cached InputPeer
+    still works for reading/forwarding.
+    """
+    is_numeric = str(name).replace("-", "").isdigit()
+    if is_numeric:
         clean = str(name).replace("-100", "")
         for fmt in (int(name), int(f"-100{clean}"), int(clean)):
             try:
                 return await client.get_entity(fmt)
             except (ValueError, Exception):
                 continue
+        # Fallback: find a cached dialog peer with this id (deleted accounts).
+        peer = await _cached_dialog_peer(client, int(clean))
+        if peer is not None:
+            return peer
     for candidate in (name, f"@{name}"):
         try:
             return await client.get_entity(candidate)
         except ValueError:
             continue
     raise ValueError(f"Could not find channel/user: {name}")
+
+
+async def _cached_dialog_peer(client: TelegramClient, user_id: int):
+    """Return an InputPeer for a dialog cached in the session (deleted-account safe)."""
+    try:
+        async for d in client.iter_dialogs(limit=1000):
+            ent = d.entity
+            if getattr(ent, "id", None) == user_id:
+                try:
+                    return await client.get_input_entity(ent)
+                except Exception:
+                    return ent
+    except Exception:
+        return None
+    return None
