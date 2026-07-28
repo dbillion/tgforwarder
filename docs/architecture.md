@@ -2,33 +2,33 @@
 
 ```mermaid
 flowchart TD
-    A[User runs tgf forward] --> B{Args or .env?}
-    B -->|no args| C[Interactive menu:<br/>source / dest / order / mode]
-    B -->|--source/--dest or .env| D[Resolve config]
+    A["User runs tgf forward"] --> B{"Args or .env?"}
+    B -->|"no args"| C["Interactive menu: source / dest / order / mode"]
+    B -->|"--source/--dest or .env"| D["Resolve config"]
     C --> D
-    D --> E[resolve_entity<br/>numeric ID / @handle / name]
-    E -->|deleted-account chat| E1[Cached-dialog<br/>InputPeer fallback]
-    E --> F[TelegramClient<br/>MTProto session]
-    F --> G[iter_messages<br/>order=oldest|newest, --all, resume]
-    G --> H{For each message}
-    H --> I{Already in done set?<br/>O(1) set lookup}
-    I -->|yes| H
-    I -->|no| J[forward_messages<br/>native Telegram copy]
-    J -->|fails| K[fallback: download_media<br/>+ kreuzberg OCR rename<br/>+ send_file]
-    K --> L[mark cache + logger.record]
+    D --> E["resolve_entity: numeric ID, handle, or name"]
+    E -->|"deleted-account chat"| E1["Cached-dialog InputPeer fallback"]
+    E --> F["TelegramClient MTProto session"]
+    F --> G["iter_messages: order oldest or newest, --all, resume"]
+    G --> H{"For each message"}
+    H --> I{"Already in done set? O(1) set lookup"}
+    I -->|"yes"| H
+    I -->|"no"| J["forward_messages: native Telegram copy"]
+    J -->|"fails"| K["fallback: download_media + kreuzberg OCR rename + send_file"]
+    K --> L["mark cache + logger.record"]
     J --> L
-    L --> M{50 buffered?}
-    M -->|yes| N[mark_many<br/>executemany batch]
-    M -->|no| H
+    L --> M{"50 buffered?"}
+    M -->|"yes"| N["mark_many: executemany batch"]
+    M -->|"no"| H
     N --> H
-    H -->|done| O[Persist resume state<br/>last_id + direction]
-    O --> P[ForwardLogger.render<br/>count / types / 5-min window / names]
-    P --> Q[(Saved Messages / target channels)]
+    H -->|"done"| O["Persist resume state: last_id + direction"]
+    O --> P["ForwardLogger.render: count / types / 5-min window / names"]
+    P --> Q["Saved Messages or target channels"]
 
-    R[(.env: API id/hash<br/>SOURCE/DEST/PATH)] -.creds.-> F
-    S[(forwarder.db SQLite<br/>dedup cache)] -.load_done_set.-> I
-    T[(.forward_state.json<br/>resume)] -.load/save.-> G
-    U[(kreuzberg: Rust OCR<br/>Python API)] -.fallback OCR.-> K
+    R[".env: API id and hash, SOURCE/DEST/PATH"] -.creds.-> F
+    S["forwarder.db SQLite dedup cache"] -.load_done_set.-> I
+    T[".forward_state.json resume"] -.load/save.-> G
+    U["kreuzberg: Rust OCR Python API"] -.fallback OCR.-> K
 ```
 
 ## Data-flow summary
