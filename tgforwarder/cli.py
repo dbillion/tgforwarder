@@ -468,6 +468,10 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                             console.print(f"[yellow]⚠️  download/OCR failed for msg {msg.id}: {e}[/yellow]")
                             continue
                     # For text-only messages, final_name is None (send_message with text only).
+                    # Skip messages with neither text nor downloadable media (can't send empty).
+                    if not text and not media_path:
+                        console.print(f"[yellow]⚠️  msg {msg.id}: no text and no downloadable media — skipping[/yellow]")
+                        continue
                     copy_batch.append((msg, h, text, media_path, final_name))
                     count += 1
                     # Download→upload→delete once the batch is full (flat disk footprint).
