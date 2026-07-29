@@ -20,7 +20,9 @@ WINDOW_MINUTES = 5
 MAX_NAMES = 50  # cap stored names to keep memory O(1) at 5000+ scale
 
 
-def _ext(name: str) -> str:
+def _ext(name: str | None) -> str:
+    if name is None:
+        return "text"
     return Path(name).suffix.lower().lstrip(".") or "unknown"
 
 

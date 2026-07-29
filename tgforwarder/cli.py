@@ -385,10 +385,12 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
             # flat at 65k+ scale, we process in batches: download a batch's media, upload to all
             # targets that lack each hash, then PERMANENTLY delete the batch's temp files before
             # fetching the next batch. Dedup by content hash (no saved_from_peer in copy mode).
+            # Media files are renamed using OCR (kreuzberg fast path → tesseract fallback) to
+            # meaningful names (first 30 chars of extracted text) instead of temp_<id>.
             if copy_mode:
                 import tempfile, os as _os
                 copy_pending: list[dict] = []
-                copy_batch: list = []          # collected (msg, hash, text, media_path) tuples
+                copy_batch: list = []          # collected (msg, hash, text, media_path, final_name) tuples
                 temp_paths: list[str] = []    # files to delete after this batch uploads
                 copy_reverse = (order == "oldest")
                 copy_min_id = 0 if rebuild_cache else offset_id
@@ -396,7 +398,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                 async def _flush_copy_batch():
                     """Upload the current copy batch to all targets, mark, then delete temp files."""
                     nonlocal run_forwarded
-                    for msg, h, text, media_path in copy_batch:
+                    for msg, h, text, media_path, final_name in copy_batch:
                         for t in tgts:
                             if h in done_by_target.get(t.id, set()):
                                 continue  # already delivered to this target
@@ -408,9 +410,9 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                                     run_forwarded += 1
                                     copy_pending.append({"source_id": src.id, "source_msg_id": msg.id,
                                                          "target_id": t.id, "target_msg_id": sent.id,
-                                                         "file_name": original_filename(msg),
+                                                         "file_name": final_name,
                                                          "content_hash": h})
-                                    logger.record(original_filename(msg))
+                                    logger.record(final_name)
                             except Exception as e:
                                 console.print(f"[yellow]⚠️  send to target {t.id} failed (msg {msg.id}): {e}[/yellow]")
                                 # do NOT add to done_by_target -> retries next run
@@ -440,17 +442,33 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                     text = (getattr(msg, "message", None) or getattr(msg, "text", None)
                             or getattr(msg, "caption", None) or "")
                     media_path = None
+                    final_name = None
                     if msg.media:
                         try:
+                            # Download to temp file first.
                             tf = tempfile.NamedTemporaryFile(delete=False, suffix=Path(original_filename(msg)).suffix)
                             tf.close()
                             media_path = await client.download_media(msg, file=tf.name)
-                            if media_path:
+                            if not media_path:
+                                console.print(f"[yellow]⚠️  msg {msg.id}: media not downloadable (paid/protected) — skipping media, sending text only[/yellow]")
+                                media_path = None
+                                final_name = None
+                            else:
                                 temp_paths.append(str(media_path))
+                                # Try original filename first.
+                                final_name = original_filename(msg)
+                                # If original filename is generic (temp_<id>), try OCR to get a meaningful name.
+                                if final_name and final_name.startswith("temp_"):
+                                    extracted_text, suggested = extract_text(media_path)
+                                    if extracted_text:
+                                        base = "_".join(extracted_text.strip().split()[:5]).replace("/", "_")[:30]
+                                        ext = Path(media_path).suffix
+                                        final_name = f"{base}{ext}" if base else final_name
                         except Exception as e:
-                            console.print(f"[yellow]⚠️  download failed for msg {msg.id}: {e}[/yellow]")
+                            console.print(f"[yellow]⚠️  download/OCR failed for msg {msg.id}: {e}[/yellow]")
                             continue
-                    copy_batch.append((msg, h, text, media_path))
+                    # For text-only messages, final_name is None (send_message with text only).
+                    copy_batch.append((msg, h, text, media_path, final_name))
                     count += 1
                     # Download→upload→delete once the batch is full (flat disk footprint).
                     if len(copy_batch) >= batch_size:
