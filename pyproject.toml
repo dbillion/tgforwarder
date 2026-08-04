@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tgforwarder"
-version = "0.1.0"
+version = "0.2.1"
 description = "Telegram MTProto media-forwarder with OCR + local-first SQLite cache and chat usefulness scoring"
 readme = "README.md"
 license = { file = "LICENSE" }
