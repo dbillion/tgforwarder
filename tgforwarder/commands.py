@@ -1,13 +1,15 @@
 """Async command bodies for tgforwarder CLI.
 
-Each function here is the *implementation* of a CLI command. The cli.py layer
-only declares Click options and forwards parsed args into these, keeping the
-command logic in one place and importable for testing without a TTY.
+Orchestration layer: each function is the *implementation* of a CLI command.
+Auth/dedupe/copy-mode logic lives in their own modules (login.py, dedupe.py,
+copy_mode.py) so this file stays readable. The cli.py layer only declares Click
+options and forwards parsed args here.
 """
 from __future__ import annotations
 
+import asyncio
 import os
-import tempfile
+import time
 from pathlib import Path
 
 import click
@@ -16,10 +18,11 @@ from rich.console import Console
 from . import state as fstate
 from .cache import ForwardCache
 from .client import make_client, resolve_entity
+from .copy_mode import run_copy_mode
 from .forward import extract_text, original_filename
 from .peer import (
-    WorkItem, _forward_batch, _is_from_source, content_hash_of,
-    iter_source_ids_full, iter_source_ids_recency, iter_undone, verify_ids_exist,
+    WorkItem, _forward_batch, _is_from_source, iter_source_ids_full,
+    iter_source_ids_recency, iter_undone, verify_ids_exist,
 )
 from .report import ForwardLogger
 from .score import DEFAULT_DB, format_table, score_chats
@@ -37,51 +40,6 @@ def interactive_menu() -> tuple[str, tuple[str, ...], bool, str]:
     mode = click.prompt("🔁 Mode", type=click.Choice(["start", "resume"]), default="start")
     return (src.strip(), tuple(d.strip() for d in dst.split(",") if d.strip()),
             (mode == "resume"), order)
-
-
-async def login_run(session, phone, password):
-    """Authenticate the Telegram session (one-time). See cli.login for the user docs."""
-    client = make_client(session)
-    effective_phone = phone
-    effective_password = password
-    if not effective_phone:
-        effective_phone = click.prompt("📱 Phone number (e.g. +1234567890)", default="", type=str).strip()
-    if not effective_phone:
-        console.print("[red]A phone number is required to log in.[/red]")
-        raise SystemExit(1)
-    try:
-        try:
-            await client.start(phone=effective_phone, password=effective_password or None)
-        except Exception as e:
-            msg = str(e).lower()
-            if "password" in msg or "2fa" in msg or "two-step" in msg:
-                pw = click.prompt("🔒 Cloud password (2FA)", default="", type=str, hide_input=True).strip()
-                if pw:
-                    await client.start(phone=effective_phone, password=pw)
-                else:
-                    raise
-            elif "api_id_invalid" in msg or ("api_id" in msg and "invalid" in msg):
-                console.print(
-                    "[red]❌ Telegram rejected your TELEGRAM_API_ID / TELEGRAM_API_HASH.[/red]\n"
-                    "   They are present but INVALID. Generate fresh ones at:\n"
-                    "   https://my.telegram.org → API development tools → create app\n"
-                    "   then update them in your .env file."
-                )
-                raise SystemExit(1)
-            else:
-                raise
-        me = await client.get_me()
-        console.print(
-            f"[bold green]✅ Logged in as[/bold green] "
-            f"{getattr(me, 'username', None) or getattr(me, 'first_name', None)} "
-            f"(id={me.id})"
-        )
-        console.print(f"[dim]session saved at: {client.session.filename}[/dim]")
-    except Exception as e:
-        console.print(f"[red]❌ Login failed:[/red] {type(e).__name__}: {e}")
-        raise SystemExit(1)
-    finally:
-        await client.disconnect()
 
 
 def score_run(db, topic, min_score, top, as_json):
@@ -116,49 +74,10 @@ async def test_ocr_run(source, session):
         await client.disconnect()
 
 
-async def dedupe_run(source, target, session, dry_run):
-    """Remove duplicate forwarded copies from TARGET, keeping one per source message id."""
-    from .peer import _is_from_source
-
-    client = make_client(session)
-    await client.start()
-    try:
-        src = await resolve_entity(client, source)
-        tgt = await resolve_entity(client, target)
-        seen: set[int] = set()
-        dup_ids: list[int] = []
-        console.print(f"[yellow]🔍 Scanning target '{getattr(tgt, 'title', None) or getattr(tgt, 'first_name', None) or tgt.id}' for duplicate forwards from '{getattr(src, 'title', None) or getattr(src, 'first_name', None) or src.id}'...[/yellow]")
-        async for m in client.iter_messages(tgt):
-            fwd = getattr(m, "fwd_from", None)
-            if _is_from_source(fwd, src.id):
-                sf = getattr(fwd, "saved_from_msg_id", None)
-                if sf is not None:
-                    if sf in seen:
-                        dup_ids.append(m.id)
-                    else:
-                        seen.add(sf)
-        console.print(f"[cyan]unique source messages: {len(seen)} | duplicate copies found: {len(dup_ids)}[/cyan]")
-        if not dup_ids:
-            console.print("[green]✅ No duplicates to remove.[/green]")
-            return
-        if dry_run:
-            console.print(f"[yellow]--dry-run: would delete {len(dup_ids)} duplicates (no action taken)[/yellow]")
-            return
-        chunk = 100
-        deleted = 0
-        for i in range(0, len(dup_ids), chunk):
-            await client.delete_messages(tgt, dup_ids[i:i + chunk])
-            deleted += len(dup_ids[i:i + chunk])
-            console.print(f"[dim]deleted {deleted}/{len(dup_ids)}[/dim]")
-        console.print(f"[green]✅ Removed {deleted} duplicate copies; kept {len(seen)} unique.[/green]")
-    finally:
-        await client.disconnect()
-
-
 async def forward_run(source, dest, dl_path, limit, process_all, order, session, delay,
                       batch_size, resume, start, rebuild_cache, force_rebuild,
                       quick_rebuild, copy_mode):
-    """Forward SOURCE → DEST. See cli.forward for user docs."""
+    """Forward SOURCE → DEST (native copy, or COPY mode for protected chats)."""
     if not source:
         source = os.environ.get("SOURCE_CHANNELS", "").strip()
     if not dest:
@@ -188,7 +107,7 @@ async def forward_run(source, dest, dl_path, limit, process_all, order, session,
     client = make_client(session)
     cache = ForwardCache()
     await client.start()
-    start_ts = __import__("time").perf_counter()
+    start_ts = time.perf_counter()
     try:
         src = await resolve_entity(client, source)
         tgts = [await resolve_entity(client, d) for d in dest]
@@ -202,6 +121,9 @@ async def forward_run(source, dest, dl_path, limit, process_all, order, session,
         console.print(f"[green]📥 Source:[/green] {src_label}  [green]📤 Dest:[/green] {', '.join(getattr(t, 'title', None) or getattr(t, 'first_name', None) or str(t) for t in tgts)}")
         console.print(f"[dim]   order: {order} | download dir: {dl_dir} | resume offset: {offset_id} | all: {process_all}[/dim]")
 
+        # Ground-truth dedup cache: either trust persisted rows, or rebuild from the
+        # target (full scan, or recency-bounded quick scan). In COPY mode we dedup by
+        # content hash instead, since re-posted messages carry no saved_from linkage.
         done_by_target: dict[int, set] = {}
         for t in tgts:
             if copy_mode:
@@ -229,7 +151,10 @@ async def forward_run(source, dest, dl_path, limit, process_all, order, session,
         run_forwarded = 0
         max_id = offset_id
         min_id_arg = 0 if rebuild_cache else offset_id
+
         if not copy_mode:
+            # Native forward: lazy producer yields only undelivered messages; each batch
+            # is forwarded in ONE API call per target and VERIFIED before being persisted.
             batch: list[WorkItem] = []
             producer = iter_undone(client, src, list(done_by_target.values()), order=order, min_id=min_id_arg)
             async for item in producer:
@@ -238,7 +163,7 @@ async def forward_run(source, dest, dl_path, limit, process_all, order, session,
                 if item.msg.id > max_id:
                     max_id = item.msg.id
                 for s in done_by_target.values():
-                    s.add(item.msg.id)
+                    s.add(item.msg.id)  # optimistic reservation; released on verify failure
                 batch.append(item)
                 count += 1
                 if len(batch) >= batch_size:
@@ -247,83 +172,24 @@ async def forward_run(source, dest, dl_path, limit, process_all, order, session,
                                                           src_id=src.id)
                     batch.clear()
                     if delay:
-                        await __import__("asyncio").sleep(delay)
+                        await asyncio.sleep(delay)
             if batch:
                 run_forwarded += await _forward_batch(client, tgts, batch, done_by_target, cache, pending,
                                                       logger, verify_ids_exist, mark_threshold=50,
                                                       src_id=src.id)
                 batch.clear()
+        else:
+            # COPY mode: download→re-post (protected chats that block native forward).
+            count, max_id, run_forwarded = await run_copy_mode(
+                client, src, tgts, order=order, rebuild_cache=rebuild_cache, offset_id=offset_id,
+                batch_size=batch_size, delay=delay, limit=limit, process_all=process_all,
+                done_by_target=done_by_target, cache=cache, logger=logger,
+                count=count, max_id=max_id, run_forwarded=run_forwarded,
+            )
+
         if pending:
             cache.mark_many(pending)
             pending.clear()
-
-        # ---- COPY MODE (protected chats, BATCHED download→upload→delete) ----
-        if copy_mode:
-            copy_pending: list[dict] = []
-            copy_batch: list = []
-            temp_paths: list[str] = []
-            copy_reverse = (order == "oldest")
-            copy_min_id = 0 if rebuild_cache else offset_id
-
-            async def _flush_copy_batch():
-                nonlocal run_forwarded
-                for msg, h, text, media_path in copy_batch:
-                    for t in tgts:
-                        if h in done_by_target.get(t.id, set()):
-                            continue
-                        try:
-                            sent = (await client.send_message(t, message=text, file=media_path)
-                                    if media_path else await client.send_message(t, message=text))
-                            if sent:
-                                done_by_target[t.id].add(h)
-                                run_forwarded += 1
-                                copy_pending.append({"source_id": src.id, "source_msg_id": msg.id,
-                                                     "target_id": t.id, "target_msg_id": sent.id,
-                                                     "file_name": original_filename(msg),
-                                                     "content_hash": h})
-                                logger.record(original_filename(msg))
-                        except Exception as e:
-                            console.print(f"[yellow]⚠️  send to target {t.id} failed (msg {msg.id}): {e}[/yellow]")
-                        if delay:
-                            await __import__("asyncio").sleep(delay)
-                if copy_pending:
-                    cache.mark_many(copy_pending)
-                    copy_pending.clear()
-                for p in temp_paths:
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
-                temp_paths.clear()
-                copy_batch.clear()
-
-            async for msg in client.iter_messages(src, min_id=copy_min_id, reverse=copy_reverse):
-                if not process_all and count >= limit:
-                    break
-                if msg.id > max_id:
-                    max_id = msg.id
-                h = content_hash_of(msg)
-                if all(h in s for s in done_by_target.values()):
-                    continue
-                text = (getattr(msg, "message", None) or getattr(msg, "text", None)
-                        or getattr(msg, "caption", None) or "")
-                media_path = None
-                if msg.media:
-                    try:
-                        tf = tempfile.NamedTemporaryFile(delete=False, suffix=Path(original_filename(msg)).suffix)
-                        tf.close()
-                        media_path = await client.download_media(msg, file=tf.name)
-                        if media_path:
-                            temp_paths.append(str(media_path))
-                    except Exception as e:
-                        console.print(f"[yellow]⚠️  download failed for msg {msg.id}: {e}[/yellow]")
-                        continue
-                copy_batch.append((msg, h, text, media_path))
-                count += 1
-                if len(copy_batch) >= batch_size:
-                    await _flush_copy_batch()
-            if copy_batch:
-                await _flush_copy_batch()
 
         fstate.set_progress(st, source, max_id, direction=order)
         fstate.save_state(st)
@@ -352,7 +218,7 @@ async def forward_run(source, dest, dl_path, limit, process_all, order, session,
         )
         logger.render(console)
     finally:
-        elapsed = __import__("time").perf_counter() - start_ts
+        elapsed = time.perf_counter() - start_ts
         console.print(f"[dim]⏱️  forward run: {elapsed:.2f}s[/dim]")
         await client.disconnect()
         cache.close()

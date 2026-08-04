@@ -12,9 +12,9 @@ import asyncio
 import click
 
 from . import __version__
-from .commands import (
-    dedupe_run, forward_run, login_run, score_run, test_ocr_run,
-)
+from .commands import forward_run, score_run, test_ocr_run
+from .dedupe import dedupe_run
+from .login import login_run
 from .score import DEFAULT_DB
 
 @click.group()
