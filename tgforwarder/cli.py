@@ -565,7 +565,11 @@ def test_ocr(source, session):
 def status():
     """Show configured API id presence (never prints secrets)."""
     ok = bool(os.environ.get("TELEGRAM_API_ID")) and bool(os.environ.get("TELEGRAM_API_HASH"))
-    console.print(f"api configured: {'yes' if ok else 'NO — set TELEGRAM_API_ID/TELEGRAM_API_HASH'}")
+    if ok:
+        console.print("api configured: yes")
+    else:
+        console.print("api configured: no — the next tgf command will prompt for "
+                      "TELEGRAM_API_ID / TELEGRAM_API_HASH (saved to .env)")
 
 
 @cli.command()
