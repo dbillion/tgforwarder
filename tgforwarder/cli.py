@@ -562,6 +562,73 @@ def test_ocr(source, session):
 
 
 @cli.command()
+@click.option("--session", default=None, help="Session name (defaults to TG_SESSION_NAME / forwarder_session1)")
+@click.option("--phone", default=None, help="Phone number (e.g. +1234567890). If omitted, you are prompted interactively.")
+@click.option("--password", default=None, help="2FA cloud password, if your account has one. Prompted if omitted.")
+def login(session, phone, password):
+    """Authenticate the Telegram session (one-time).
+
+    Telegram sends a login code to your phone/other client; enter it when
+    prompted. If your account has 2FA enabled you'll also be asked for the
+    cloud password. The authorized session is saved to the data dir so every
+    other tgf command reuses it — you only do this once.
+
+    Runs interactively by default. For headless use, pass --phone/--password.
+    """
+    async def run():
+        # Ensure creds are present (prompts once if missing).
+        client = make_client(session)
+        # Read phone/password ourselves so login works even when stdin is not a TTY
+        # (e.g. piped). Telethon's built-in prompt requires a real terminal.
+        effective_phone = phone
+        effective_password = password
+        if not effective_phone:
+            effective_phone = click.prompt("📱 Phone number (e.g. +1234567890)", default="", type=str).strip()
+        if not effective_phone:
+            console.print("[red]A phone number is required to log in.[/red]")
+            raise SystemExit(1)
+        try:
+            # Only prompt for the 2FA password if the account uses one (Telegram will
+            # signal it by raising a password-related error on first attempt).
+            try:
+                await client.start(phone=effective_phone, password=effective_password or None)
+            except Exception as e:
+                msg = str(e).lower()
+                if "password" in msg or "2fa" in msg or "two-step" in msg:
+                    pw = click.prompt("🔒 Cloud password (2FA)", default="", type=str, hide_input=True).strip()
+                    if pw:
+                        await client.start(phone=effective_phone, password=pw)
+                    else:
+                        raise
+                elif "api_id_invalid" in msg or "api_id" in msg and "invalid" in msg:
+                    # The credentials exist but Telegram rejects them — almost always
+                    # expired/revoked/wrong values from my.telegram.org.
+                    console.print(
+                        "[red]❌ Telegram rejected your TELEGRAM_API_ID / TELEGRAM_API_HASH.[/red]\n"
+                        "   They are present but INVALID. Generate fresh ones at:\n"
+                        "   https://my.telegram.org → API development tools → create app\n"
+                        "   then update them in your .env file."
+                    )
+                    raise SystemExit(1)
+                else:
+                    raise
+            me = await client.get_me()
+            console.print(
+                f"[bold green]✅ Logged in as[/bold green] "
+                f"{getattr(me, 'username', None) or getattr(me, 'first_name', None)} "
+                f"(id={me.id})"
+            )
+            console.print(f"[dim]session saved at: {client.session.filename}[/dim]")
+        except Exception as e:
+            console.print(f"[red]❌ Login failed:[/red] {type(e).__name__}: {e}")
+            raise SystemExit(1)
+        finally:
+            await client.disconnect()
+
+    asyncio.run(run())
+
+
+@cli.command()
 def status():
     """Show configured API id presence (never prints secrets)."""
     ok = bool(os.environ.get("TELEGRAM_API_ID")) and bool(os.environ.get("TELEGRAM_API_HASH"))
