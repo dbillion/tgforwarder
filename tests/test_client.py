@@ -40,6 +40,8 @@ def test_ensure_credentials_prompts_when_missing(monkeypatch, tmp_path):
     answers = iter(["28150103", "deadbeefdeadbeefdeadbeefdeadbeef"])
     import click as _click
     with mock.patch.object(_click, "prompt", side_effect=lambda *a, **k: next(answers)):
+        # Guard: never let the test persist its canned creds to the REAL repo .env.
+        monkeypatch.setattr(cl, "_persist_creds", lambda *a, **k: None)
         # Must NOT raise SystemExit now.
         cl.ensure_credentials()
     assert cl.get_api_id() == 28150103, "prompted API id should be set"
