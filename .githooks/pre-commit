@@ -1,0 +1,6 @@
+#!/bin/sh
+# Pre-commit hook: scan staged changes for secrets before they are committed.
+# Activated by `git config core.hooksPath .githooks` (already set in this repo).
+# Bypass for this commit only: git commit --no-verify
+ROOT=$(git rev-parse --show-toplevel)
+exec sh "$ROOT/scripts/secret-scan.sh" staged
