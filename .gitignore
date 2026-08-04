@@ -11,6 +11,8 @@ __pycache__/
 # Secrets / local config (NEVER commit)
 .env
 .env.*
+# BUT allow the committed placeholder template:
+!.env.example
 *.session
 *.session-journal
 
