@@ -284,10 +284,10 @@ def test_logger_caps_names_memory():
 
 
 # --------------------------------------------------------------------------
-# cli._is_from_source — channel vs user peer matching
+# peer._is_from_source — channel vs user peer matching
 # --------------------------------------------------------------------------
 def test_is_from_source_matches_channel_and_user():
-    from tgforwarder.cli import _is_from_source
+    from tgforwarder.peer import _is_from_source
     from telethon.tl.types import PeerChannel, PeerUser, MessageFwdHeader
     from datetime import datetime
 
