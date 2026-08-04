@@ -304,3 +304,25 @@ def test_is_from_source_matches_channel_and_user():
     assert _is_from_source(fwd_chan, user_src) is False
     # No forward header must not match.
     assert _is_from_source(None, chan_src) is False
+
+
+# --------------------------------------------------------------------------
+# client.load_project_env — .env must load regardless of CWD
+# --------------------------------------------------------------------------
+def test_load_project_env_finds_repo_dotenv_from_foreign_cwd(monkeypatch, tmp_path):
+    """Regression: `tgf` invoked from a non-repo dir previously failed to load
+    .env (it used load_dotenv(Path('.env')) = CWD-relative), so API creds were
+    missing and the CLI printed 'Set TELEGRAM_API_ID ...'. The loader must resolve
+    .env relative to the package/repo, not the caller's CWD.
+    """
+    import os
+    from tgforwarder import client as cl
+
+    repo_env = Path(cl.__file__).resolve().parent.parent / ".env"  # .../tgforwarder/..
+    assert repo_env.exists(), "repo .env must exist for this test"
+    monkeypatch.chdir(tmp_path)              # simulate running from a foreign dir
+    monkeypatch.delenv("TELEGRAM_API_ID", raising=False)   # ensure not inherited
+    monkeypatch.delenv("TELEGRAM_API_HASH", raising=False)
+    cl.load_project_env()
+    assert cl.get_api_id() != 0, "API id should load from repo .env even from foreign CWD"
+    assert cl.get_api_hash(), "API hash should load from repo .env even from foreign CWD"

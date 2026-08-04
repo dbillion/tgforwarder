@@ -4,12 +4,53 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from telethon import TelegramClient
 
-load_dotenv()
-
 DEFAULT_SESSION = "forwarder_session1"
+
+
+def load_project_env() -> None:
+    """Load .env robustly regardless of the current working directory.
+
+    The CLI was previously calling load_dotenv(Path(".env")), which only looks in
+    the CWD. When `tgf` is invoked from another directory (or as an installed
+    console script), that resolves to the wrong path and the API credentials are
+    never loaded -> "Set TELEGRAM_API_ID and TELEGRAM_API_HASH" error.
+
+    Resolution order:
+      1. .env next to the package (repo root) and a couple of parents
+      2. .env in the CWD (existing workflow)
+      3. dotenv's own upward walk from CWD
+    Values are stripped of surrounding whitespace as a belt-and-suspenders measure.
+    """
+    candidates = []
+    try:
+        pkg_root = Path(__file__).resolve().parent.parent  # .../tgforwarder -> repo
+        candidates.append(pkg_root / ".env")
+        candidates.append(pkg_root.parent / ".env")
+        candidates.append(pkg_root.parent.parent / ".env")
+    except Exception:
+        pass
+    candidates.append(Path.cwd() / ".env")
+
+    loaded_any = False
+    for c in candidates:
+        if c.exists():
+            load_dotenv(c, override=False)
+            loaded_any = True
+    if not loaded_any:
+        # Last resort: dotenv's upward search from CWD.
+        load_dotenv(find_dotenv(usecwd=True, raise_error_if_not_found=False), override=False)
+
+    # Defensive whitespace strip for credential-style variables.
+    for key in ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TG_SESSION_NAME",
+                "SOURCE_CHANNELS", "TARGET_CHANNELS"):
+        if key in os.environ and os.environ[key] != os.environ[key].strip():
+            os.environ[key] = os.environ[key].strip()
+
+
+load_project_env()
 
 # Device fingerprint (matches tg-cli style) so the session looks like a real client.
 _DEVICE_MODEL = "Desktop"
@@ -18,11 +59,15 @@ _APP_VERSION = "5.12.1"
 
 
 def get_api_id() -> int:
-    return int(os.environ.get("TELEGRAM_API_ID", "0"))
+    raw = (os.environ.get("TELEGRAM_API_ID", "") or "").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 0
 
 
 def get_api_hash() -> str:
-    return os.environ.get("TELEGRAM_API_HASH", "")
+    return (os.environ.get("TELEGRAM_API_HASH", "") or "").strip()
 
 
 def make_client(session: str | None = None) -> TelegramClient:

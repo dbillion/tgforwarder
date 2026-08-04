@@ -5,11 +5,6 @@ import asyncio
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
-
-# Load .env from the current working directory (project root), not a parent.
-load_dotenv(Path(".env"), override=False)
-
 import click
 from rich.console import Console
 
