@@ -16,7 +16,7 @@ from rich.console import Console
 from . import __version__
 from .client import make_client, resolve_entity
 from .cache import ForwardCache
-from telethon.tl.types import PeerUser
+from telethon import utils
 from .forward import extract_text, original_filename
 from .score import score_chats, format_table, DEFAULT_DB
 from . import state as fstate
@@ -98,7 +98,7 @@ async def iter_source_ids_recency(client, target, src_id: int, cold_after: int =
     cold = 0
     async for m in client.iter_messages(target, reverse=False):  # newest first
         fwd = getattr(m, "fwd_from", None)
-        if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src_id):
+        if _is_from_source(fwd, src_id):
             sf = getattr(fwd, "saved_from_msg_id", None)
             if sf:
                 delivered.add(sf)
@@ -115,7 +115,7 @@ async def iter_source_ids_full(client, target, src_id: int) -> set[int]:
     delivered: set[int] = set()
     async for m in client.iter_messages(target):
         fwd = getattr(m, "fwd_from", None)
-        if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src_id):
+        if _is_from_source(fwd, src_id):
             sf = getattr(fwd, "saved_from_msg_id", None)
             if sf:
                 delivered.add(sf)
@@ -141,6 +141,17 @@ def content_hash_of(msg) -> str:
         kind = type(media).__name__
         text += f"||{kind}|{name}|{size}"
     return hashlib.sha256(text.encode("utf-8", "ignore")).hexdigest()
+
+
+def _is_from_source(fwd, src_id: int) -> bool:
+    """True if a forwarded message's saved_from_peer matches the source peer.
+
+    The source may be a channel, user, or chat, so compare against the
+    correctly-typed peer (PeerChannel / PeerUser / PeerChat) rather than a
+    hardcoded PeerUser. Otherwise channel-sourced forwards never match and the
+    dedup rebuild / final verification / dedupe command silently skip everything.
+    """
+    return bool(fwd and getattr(fwd, "saved_from_peer", None) == utils.get_peer(src_id))
 
 
 async def verify_ids_exist(client, target, ids: list[int]) -> set[int]:
@@ -472,7 +483,7 @@ def forward(source, dest, dl_path, limit, process_all, order, session, delay, ba
                     for t in tgts:
                         async for m in client.iter_messages(t):
                             fwd = getattr(m, "fwd_from", None)
-                            if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
+                            if _is_from_source(fwd, src.id):
                                 final_delivered += 1
                 except Exception:
                     final_delivered = -1
@@ -586,7 +597,7 @@ def dedupe(source, target, session, dry_run):
             console.print(f"[yellow]🔍 Scanning target '{getattr(tgt, 'title', None) or getattr(tgt, 'first_name', None) or tgt.id}' for duplicate forwards from '{getattr(src, 'title', None) or getattr(src, 'first_name', None) or src.id}'...[/yellow]")
             async for m in client.iter_messages(tgt):
                 fwd = getattr(m, "fwd_from", None)
-                if fwd and getattr(fwd, "saved_from_peer", None) == PeerUser(src.id):
+                if _is_from_source(fwd, src.id):
                     sf = getattr(fwd, "saved_from_msg_id", None)
                     if sf is not None:
                         if sf in seen:
