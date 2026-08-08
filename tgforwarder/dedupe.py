@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from rich.console import Console
 
-from .client import make_client, resolve_entity
+from .client import connect_authorized, make_client, resolve_entity
 from .peer import _is_from_source
 
 console = Console()
@@ -18,7 +18,7 @@ async def dedupe_run(source, target, session, dry_run):
     redundant copy via client.delete_messages. Use --dry-run first to preview.
     """
     client = make_client(session)
-    await client.start()
+    await connect_authorized(client)
     try:
         src = await resolve_entity(client, source)
         tgt = await resolve_entity(client, target)

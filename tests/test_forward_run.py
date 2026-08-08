@@ -49,6 +49,12 @@ class _StubClient:
     async def start(self):
         return None
 
+    async def connect(self):
+        return None
+
+    async def is_user_authorized(self):
+        return True
+
     async def disconnect(self):
         return None
 

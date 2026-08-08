@@ -32,6 +32,9 @@ def load_project_env() -> None:
         candidates.append(pkg_root.parent.parent / ".env")
     except Exception:
         pass
+    # Fixed home config location so `tgf` works from ANY directory (installed via uv).
+    candidates.append(Path.home() / ".config" / "tgforwarder" / ".env")
+    candidates.append(Path.home() / ".env")
     candidates.append(Path.cwd() / ".env")
 
     loaded_any = False
@@ -157,6 +160,35 @@ def make_client(session: str | None = None) -> TelegramClient:
         system_version=_SYSTEM_VERSION,
         app_version=_APP_VERSION,
     )
+
+
+async def connect_authorized(client: TelegramClient) -> None:
+    """Connect and verify the session is already authorized.
+
+    Root cause of the "authentication problem" in forward/copy/dedupe/test-ocr:
+    those commands called bare `client.start()`. Telethon's `start()` is fine
+    when the session IS already authorized (it's a no-op login), but when it
+    ISN'T, `start()` with no phone/code_callback falls back to Python's raw
+    `input()` to ask for a phone number and login code. That blocks forever (or
+    raises EOFError) in any non-interactive context -- a background run, a
+    piped shell, cron/systemd, an agent invocation -- with no useful error
+    message. `tgf login` already has the correct interactive flow (phone + 2FA
+    via click.prompt, clear error on invalid API creds); every other command
+    should require that to have been run already, not silently attempt it.
+    """
+    await client.connect()
+    if not await client.is_user_authorized():
+        from rich.console import Console
+
+        console = Console()
+        console.print(
+            "[red]❌ Session is not authorized.[/red]\n"
+            f"   Session file: {client.session.filename}\n"
+            "   Run [bold]tgf login[/bold] once to authenticate "
+            "(phone code + optional 2FA), then re-run this command."
+        )
+        await client.disconnect()
+        raise SystemExit(1)
 
 
 async def resolve_entity(client: TelegramClient, name: str):

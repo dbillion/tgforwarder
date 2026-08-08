@@ -17,7 +17,7 @@ from rich.console import Console
 
 from . import state as fstate
 from .cache import ForwardCache
-from .client import make_client, resolve_entity
+from .client import connect_authorized, make_client, resolve_entity
 from .copy_mode import run_copy_mode
 from .forward import extract_text, original_filename
 from .peer import (
@@ -57,7 +57,7 @@ def score_run(db, topic, min_score, top, as_json):
 async def test_ocr_run(source, session):
     """Test OCR on the last 3 media messages in SOURCE."""
     client = make_client(session)
-    await client.start()
+    await connect_authorized(client)
     try:
         src = await resolve_entity(client, source)
         n = 0
@@ -106,7 +106,7 @@ async def forward_run(source, dest, dl_path, limit, process_all, order, session,
 
     client = make_client(session)
     cache = ForwardCache()
-    await client.start()
+    await connect_authorized(client)
     start_ts = time.perf_counter()
     try:
         src = await resolve_entity(client, source)

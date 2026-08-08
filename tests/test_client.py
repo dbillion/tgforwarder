@@ -1,9 +1,12 @@
 """Unit tests for tgforwarder.client env loading + credential prompting."""
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 from unittest import mock
+
+import pytest
 
 from tgforwarder import client as cl
 
@@ -46,3 +49,49 @@ def test_ensure_credentials_prompts_when_missing(monkeypatch, tmp_path):
         cl.ensure_credentials()
     assert cl.get_api_id() == 28150103, "prompted API id should be set"
     assert cl.get_api_hash() == "deadbeefdeadbeefdeadbeefdeadbeef", "prompted hash should be set"
+
+
+class _FakeUnauthorizedClient:
+    """Connects fine but reports an unauthorized session (the actual bug: a
+    session file exists and connects, but was never logged in / got revoked)."""
+    def __init__(self):
+        self.session = mock.Mock(filename="/tmp/fake_session")
+        self.connected = False
+        self.disconnected = False
+
+    async def connect(self):
+        self.connected = True
+
+    async def is_user_authorized(self):
+        return False
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
+class _FakeAuthorizedClient(_FakeUnauthorizedClient):
+    async def is_user_authorized(self):
+        return True
+
+
+def test_connect_authorized_raises_clean_error_when_not_logged_in():
+    """Regression: forward/copy/dedupe/test-ocr used to call bare `client.start()`,
+    which falls back to Telethon's blocking `input()` phone prompt when the
+    session isn't authorized -- hangs/EOFErrors in any non-interactive context
+    with no useful message. `connect_authorized` must fail fast with SystemExit
+    and point the user at `tgf login`, and must disconnect on the way out.
+    """
+    fake = _FakeUnauthorizedClient()
+    with pytest.raises(SystemExit):
+        asyncio.run(cl.connect_authorized(fake))
+    assert fake.connected, "should still attempt connect() before checking auth"
+    assert fake.disconnected, "should disconnect cleanly rather than leak the connection"
+
+
+def test_connect_authorized_passes_through_when_logged_in():
+    """When the session IS authorized, connect_authorized should just connect
+    and return -- no error, no disconnect."""
+    fake = _FakeAuthorizedClient()
+    asyncio.run(cl.connect_authorized(fake))
+    assert fake.connected
+    assert not fake.disconnected
